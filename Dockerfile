@@ -2,6 +2,8 @@
 # On Render, the WHISPER_MODEL environment variable is passed in as this build arg.
 FROM python:3.12-slim AS export
 ARG WHISPER_MODEL=openai/whisper-tiny
+# More models for the Benchmark tab to compare, space-separated (e.g. "openai/whisper-base").
+ARG BENCHMARK_MODELS=""
 WORKDIR /build
 COPY requirements-export.txt scripts/export_whisper_onnx.py ./
 # --index-url (not --extra-index-url) guarantees the CPU wheel instead of the multi-GB CUDA build.
@@ -10,7 +12,10 @@ COPY requirements-export.txt scripts/export_whisper_onnx.py ./
 RUN pip install --no-cache-dir "setuptools>=77.0.3" \
  && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.14.1 \
  && pip install --no-cache-dir -r requirements-export.txt
-RUN python export_whisper_onnx.py --model "$WHISPER_MODEL" --output /models/whisper --prune
+RUN python export_whisper_onnx.py --model "$WHISPER_MODEL" --output /models/whisper --prune \
+ && for model in $BENCHMARK_MODELS; do \
+      python export_whisper_onnx.py --model "$model" --output "/models/$(basename "$model")" --prune; \
+    done
 
 # Stage 2: runtime with ONNX Runtime only
 FROM python:3.12-slim
@@ -24,12 +29,15 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY --from=export /models/whisper /app/models/whisper
+COPY --from=export /models /app/models
 COPY app ./app
 COPY scripts ./scripts
 COPY main.py .
 
+# Models stay under /app/models: a disk mounted at /data would hide whatever the image has there.
 ENV WHISPER_MODEL_DIR=/app/models/whisper \
+    MODELS_DIR=/app/models \
+    BENCHMARK_DIR=/data/benchmark \
     UPLOAD_DIR=/tmp/uploads \
     PORT=10000
 EXPOSE 10000

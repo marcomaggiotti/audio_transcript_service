@@ -1,0 +1,750 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audio Transcript</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1d2330; --muted: #5d6677; --line: #dde1e8;
+  --accent: #2f5bd3; --accent-ink: #ffffff; --accent-soft: #e6ecfb;
+  --good: #1f8a4c; --good-soft: #e3f4ea; --bad: #c2362f; --bad-soft: #fbe7e5; --warn: #b7791f;
+  --sel: rgba(47, 91, 211, .18); --seg: #c9d3ea; --seg-hover: #aebbe0;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b; --panel: #1b1f27; --ink: #e6e9ef; --muted: #9aa3b2; --line: #2d333e;
+    --accent: #7c9cff; --accent-ink: #0d1220; --accent-soft: #232c45;
+    --good: #5fcf8e; --good-soft: #1b3326; --bad: #ff7b72; --bad-soft: #3a1f1f; --warn: #e3b341;
+    --sel: rgba(124, 156, 255, .22); --seg: #36405a; --seg-hover: #4a5677;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--line); }
+header h1 { font-size: 17px; margin: 0; }
+header .status { color: var(--muted); font-size: 13px; }
+header .token { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+nav { display: flex; gap: 4px; }
+nav button { background: none; border: 0; padding: 7px 14px; border-radius: 8px; color: var(--muted); font-weight: 600; cursor: pointer; }
+nav button[aria-selected="true"] { background: var(--accent-soft); color: var(--accent); }
+main { max-width: 1180px; margin: 0 auto; padding: 20px 16px 60px; }
+section.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin-bottom: 18px; }
+section.panel > h2 { font-size: 16px; margin: 0 0 4px; display: flex; align-items: center; gap: 8px; }
+.step { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: var(--accent); color: var(--accent-ink); font-size: 12px; }
+.hint { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
+.row { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
+.row > * { min-width: 0; }
+label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
+label.check { display: flex; align-items: center; gap: 6px; color: var(--ink); font-size: 14px; }
+input, select, textarea, button { font: inherit; color: inherit; }
+input[type=text], input[type=password], input[type=number], select, textarea {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; }
+textarea { width: 100%; resize: vertical; min-height: 64px; }
+input[type=number] { width: 92px; }
+button { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 7px 12px; cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+button.small { padding: 3px 8px; font-size: 13px; }
+button.danger:hover { border-color: var(--bad); color: var(--bad); }
+button:disabled { opacity: .5; cursor: default; }
+.hidden { display: none !important; }
+.muted { color: var(--muted); }
+.mono { font-family: var(--mono); font-size: 13px; }
+.error { color: var(--bad); font-size: 14px; }
+.grid2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; }
+@media (max-width: 860px) { .grid2 { grid-template-columns: 1fr; } }
+.progress { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin: 8px 0; }
+.progress > div { height: 100%; background: var(--accent); width: 0; transition: width .3s; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.scroll { overflow-x: auto; }
+.scroll > table { min-width: 640px; }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; background: var(--accent-soft); color: var(--accent); }
+.pill.good { background: var(--good-soft); color: var(--good); }
+.pill.bad { background: var(--bad-soft); color: var(--bad); }
+
+/* transcript */
+.segments { max-height: 460px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+.seg { display: grid; grid-template-columns: 22px 108px minmax(0, 1fr); gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--line); cursor: pointer; align-items: baseline; }
+.seg:last-child { border-bottom: 0; }
+.seg:hover { background: var(--accent-soft); }
+.seg.selected { background: var(--sel); }
+.seg .time { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.seg.plain { grid-template-columns: 70px minmax(0, 1fr); }
+.conf { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 4px; vertical-align: middle; }
+
+/* interval picker */
+.sources { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+.source { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; cursor: pointer; font-size: 14px; background: var(--bg); }
+.source[aria-selected="true"] { border-color: var(--accent); background: var(--accent-soft); }
+.timeline { position: relative; height: 46px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; margin: 10px 0 4px; cursor: crosshair; overflow: hidden; }
+.timeline .block { position: absolute; top: 8px; bottom: 8px; background: var(--seg); border-radius: 3px; border: 1px solid var(--panel); cursor: pointer; }
+.timeline .block:hover { background: var(--seg-hover); }
+.timeline .block.selected { background: var(--accent); }
+.timeline .range { position: absolute; top: 0; bottom: 0; background: var(--sel); border-left: 2px solid var(--accent); border-right: 2px solid var(--accent); pointer-events: none; }
+.timeline .head { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--bad); pointer-events: none; }
+.axis { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+audio { width: 100%; margin-top: 6px; }
+.editor { border: 1px dashed var(--accent); border-radius: 10px; padding: 14px; background: var(--accent-soft); }
+.editor .times { display: flex; gap: 14px; flex-wrap: wrap; align-items: end; margin-bottom: 10px; }
+.nudge { display: flex; gap: 4px; align-items: center; }
+.clip-ref { min-height: 44px; font-size: 14px; }
+
+/* results */
+.werbar { display: inline-block; height: 8px; border-radius: 4px; background: var(--accent); vertical-align: middle; margin-left: 6px; }
+tr.best td { background: var(--good-soft); }
+tr.clickable { cursor: pointer; }
+tr.clickable:hover td { background: var(--accent-soft); }
+.diff { line-height: 1.9; font-size: 14px; }
+.diff del { color: var(--bad); text-decoration: line-through; background: var(--bad-soft); padding: 0 2px; border-radius: 3px; }
+.diff ins { color: var(--good); text-decoration: none; background: var(--good-soft); padding: 0 2px; border-radius: 3px; }
+.diff .sub { white-space: nowrap; }
+.clipres { border-top: 1px solid var(--line); padding: 10px 0; }
+.clipres h4 { margin: 0 0 4px; font-size: 14px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.runs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Audio Transcript</h1>
+  <nav role="tablist">
+    <button role="tab" data-tab="transcribe" aria-selected="true">Transcribe</button>
+    <button role="tab" data-tab="benchmark" aria-selected="false">Benchmark</button>
+  </nav>
+  <span class="status" id="health">…</span>
+  <div class="token">
+    <input type="password" id="token" placeholder="API token" autocomplete="off" size="16">
+    <button class="small" id="saveToken">Use token</button>
+  </div>
+</header>
+
+<main>
+<!-- ============================================================== transcribe -->
+<div id="tab-transcribe">
+  <section class="panel">
+    <h2>Transcribe a recording</h2>
+    <p class="hint">WAV, MP3, OGG/Opus, M4A or FLAC. Setting the language helps: auto-detect only listens to the first 30 seconds.</p>
+    <form id="transcribeForm" class="row">
+      <label>Audio<input type="file" name="file" accept="audio/*,.ogg,.opus,.m4a,.flac" required></label>
+      <label>Language<select name="language" class="languages"></select></label>
+      <label class="check"><input type="checkbox" name="temperature_fallback" checked> Temperature fallback</label>
+      <label class="check"><input type="checkbox" name="condition_on_previous_text" checked> Previous-text prompt</label>
+      <label style="flex:1 1 220px">Initial prompt (names, terms)<input type="text" name="initial_prompt" placeholder="ONNX Runtime, Whisper, Render"></label>
+      <button class="primary" type="submit">Transcribe</button>
+    </form>
+    <div id="jobBox" class="hidden">
+      <div class="progress"><div id="jobProgress"></div></div>
+      <div class="muted" id="jobStatus"></div>
+    </div>
+  </section>
+
+  <section class="panel hidden" id="resultBox">
+    <h2>Transcript <span class="pill" id="resultMeta"></span></h2>
+    <p class="hint" id="resultMetrics"></p>
+    <div class="row" style="margin-bottom:10px">
+      <button class="small" data-download="text">Download .txt</button>
+      <button class="small" data-download="srt">Download .srt</button>
+      <button class="small" data-download="vtt">Download .vtt</button>
+      <button class="small" id="copyText">Copy text</button>
+    </div>
+    <audio id="localPlayer" controls></audio>
+    <div class="segments" id="resultSegments"></div>
+  </section>
+</div>
+
+<!-- ============================================================== benchmark -->
+<div id="tab-benchmark" class="hidden">
+  <section class="panel">
+    <h2><span class="step">1</span> Reference intervals</h2>
+    <p class="hint">Upload a real recording. Whisper proposes segments; choose the intervals that best represent your audio
+      (clear, complete sentences), listen to them, correct every word and save them as reference clips.
+      20–30 clips across speakers and conditions give a reliable score.</p>
+    <form id="sourceForm" class="row">
+      <label>Recording<input type="file" name="file" accept="audio/*,.ogg,.opus,.m4a,.flac" required></label>
+      <label>Language<select name="language" class="languages"></select></label>
+      <button class="primary" type="submit">Upload and propose intervals</button>
+    </form>
+    <div class="sources" id="sources"></div>
+
+    <div id="picker" class="hidden">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <strong id="pickerTitle"></strong>
+        <span class="row">
+          <button class="small" id="retranscribe">Propose again</button>
+          <button class="small danger" id="deleteSource">Delete recording</button>
+        </span>
+      </div>
+      <div id="sourceWait" class="hidden">
+        <div class="progress"><div id="sourceProgress"></div></div>
+        <div class="muted" id="sourceStatus"></div>
+      </div>
+      <div id="sourceReady" class="hidden">
+        <div class="timeline" id="timeline" title="Click a segment to select it, shift-click to extend; click elsewhere to move the playhead"></div>
+        <div class="axis" id="axis"></div>
+        <audio id="sourcePlayer" controls preload="auto"></audio>
+        <div class="grid2" style="margin-top:12px">
+          <div>
+            <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:6px">
+              <span class="muted" style="font-size:13px">Whisper's segments · <span class="conf" style="background:var(--good)"></span>confident
+                <span class="conf" style="background:var(--warn)"></span>unsure <span class="conf" style="background:var(--bad)"></span>likely wrong</span>
+              <button class="small" id="clearSel">Clear selection</button>
+            </div>
+            <div class="segments" id="sourceSegments"></div>
+          </div>
+          <div class="editor" id="editor">
+            <div class="muted" id="editorEmpty">Select one segment, or shift-click to select several in a row, to make an interval.</div>
+            <div id="editorBody" class="hidden">
+              <div class="times">
+                <label>Start (s)<span class="nudge"><button class="small" type="button" data-nudge="start:-0.1">−</button><input type="number" id="ivStart" step="0.1" min="0"><button class="small" type="button" data-nudge="start:0.1">+</button></span></label>
+                <label>End (s)<span class="nudge"><button class="small" type="button" data-nudge="end:-0.1">−</button><input type="number" id="ivEnd" step="0.1" min="0"><button class="small" type="button" data-nudge="end:0.1">+</button></span></label>
+                <button class="small" type="button" id="startHere">Start at playhead</button>
+                <button class="small" type="button" id="endHere">End at playhead</button>
+                <button type="button" id="playInterval">▶ Play interval</button>
+              </div>
+              <label>Correct transcript of this interval (what is really said)
+                <textarea id="ivText" rows="5"></textarea></label>
+              <div class="row" style="margin-top:10px">
+                <label style="flex:1">Name<input type="text" id="ivName" placeholder="optional"></label>
+                <button class="primary" type="button" id="saveClip">Save reference clip</button>
+              </div>
+              <div class="muted" id="ivInfo" style="font-size:13px;margin-top:6px"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2><span class="step">2</span> Reference clips <span class="pill" id="clipCount">0</span></h2>
+    <p class="hint">The benchmark set. Edit a transcript in place; it saves when you leave the box. Unticked clips are left out of runs.</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th></th><th>Clip</th><th class="num">Length</th><th>Correct transcript</th><th></th></tr></thead>
+        <tbody id="clips"></tbody>
+      </table>
+    </div>
+    <details style="margin-top:12px">
+      <summary class="muted">Import a clip you already cut</summary>
+      <form id="importForm" class="row" style="margin-top:10px">
+        <label>Audio<input type="file" name="file" accept="audio/*,.ogg,.opus,.m4a,.flac" required></label>
+        <label style="flex:1 1 260px">Correct transcript<input type="text" name="reference" required></label>
+        <label>Name<input type="text" name="name"></label>
+        <button type="submit">Add clip</button>
+      </form>
+    </details>
+    <audio id="clipPlayer" class="hidden"></audio>
+  </section>
+
+  <section class="panel">
+    <h2><span class="step">3</span> Run the benchmark</h2>
+    <p class="hint">Every ticked clip is transcribed with each model and decoding variant. Runs wait their turn in the transcription queue.
+      Models come from <span class="mono">MODELS_DIR</span>: export more with <span class="mono">scripts/export_whisper_onnx.py</span>.</p>
+    <div class="grid2">
+      <div><strong style="font-size:14px">Models</strong><div id="models" style="margin-top:6px;display:grid;gap:4px"></div></div>
+      <div><strong style="font-size:14px">Decoding</strong><div id="variants" style="margin-top:6px;display:grid;gap:4px"></div></div>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <label>Language<select id="runLanguage" class="languages"></select></label>
+      <label style="flex:1 1 260px">Initial prompt (optional)<input type="text" id="runPrompt" placeholder="names and terms that occur in the audio"></label>
+      <button class="primary" id="runBenchmark">Run benchmark</button>
+    </div>
+    <div class="error" id="runError"></div>
+  </section>
+
+  <section class="panel">
+    <h2><span class="step">4</span> Results</h2>
+    <p class="hint">WER = wrong + missing + extra words, divided by the words in the references (lower is better). Case and punctuation are ignored.
+      RTF = transcription time / audio length. Click a row to see each clip's differences.</p>
+    <div class="runs" id="runs"></div>
+    <div id="runView"></div>
+  </section>
+</div>
+</main>
+
+<script>
+"use strict";
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+
+function h(tag, attrs = {}, ...children) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === "class") el.className = v;
+    else if (k === "style") el.style.cssText = v;
+    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  for (const c of children.flat()) if (c !== null && c !== undefined && c !== false) el.append(c instanceof Node ? c : String(c));
+  return el;
+}
+
+const clock = s => {
+  if (s == null || isNaN(s)) return "–";
+  const m = Math.floor(s / 60), sec = s - m * 60;
+  return `${m}:${sec.toFixed(1).padStart(4, "0")}`;
+};
+const pct = v => v == null ? "–" : `${(v * 100).toFixed(1)}%`;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ----------------------------------------------------------------- API + token
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch { /* private mode */ } },
+};
+let token = store.get("apiToken") || "";
+$("#token").value = token;
+$("#saveToken").onclick = () => { token = $("#token").value.trim(); store.set("apiToken", token); refreshAll(); };
+
+async function api(path, options = {}) {
+  const headers = { ...(options.headers || {}) };
+  if (token) headers["X-API-Key"] = token;
+  if (options.json !== undefined) { headers["Content-Type"] = "application/json"; options.body = JSON.stringify(options.json); }
+  const res = await fetch(path, { ...options, headers });
+  if (res.status === 401) { $("#token").focus(); throw new Error("This service needs its API token (top right)."); }
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { const body = await res.json(); detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail); } catch {}
+    throw new Error(detail);
+  }
+  if (res.status === 204) return null;
+  const type = res.headers.get("content-type") || "";
+  return type.includes("json") ? res.json() : res.blob();
+}
+
+function toast(message) { alert(message); }
+
+// ----------------------------------------------------------------- tabs
+function showTab(name) {
+  $$("nav button").forEach(b => b.setAttribute("aria-selected", String(b.dataset.tab === name)));
+  $("#tab-transcribe").classList.toggle("hidden", name !== "transcribe");
+  $("#tab-benchmark").classList.toggle("hidden", name !== "benchmark");
+  store.set("tab", name);
+  if (name === "benchmark") refreshBenchmark();
+}
+$$("nav button").forEach(b => b.onclick = () => showTab(b.dataset.tab));
+
+// ----------------------------------------------------------------- health + languages
+let defaultLanguage = "auto";
+async function refreshHealth() {
+  try {
+    const health = await api("/health");
+    $("#health").textContent = health.status === "ok" ? `${health.model} · queue ${health.queue_depth}` : `degraded: ${health.model_error}`;
+    const langs = await api("/languages");
+    defaultLanguage = langs.default;
+    for (const select of $$("select.languages")) {
+      const current = select.value;
+      select.replaceChildren(h("option", { value: "auto" }, "auto-detect"),
+        ...langs.languages.map(l => h("option", { value: l }, l)));
+      select.value = current || langs.default || "auto";
+    }
+  } catch (e) { $("#health").textContent = e.message; }
+}
+
+// ----------------------------------------------------------------- transcribe tab
+let lastJob = null, localUrl = null;
+$("#transcribeForm").onsubmit = async ev => {
+  ev.preventDefault();
+  const form = ev.target, data = new FormData();
+  const file = form.file.files[0];
+  data.append("file", file);
+  data.append("language", form.language.value);
+  data.append("temperature_fallback", form.temperature_fallback.checked);
+  data.append("condition_on_previous_text", form.condition_on_previous_text.checked);
+  if (form.initial_prompt.value.trim()) data.append("initial_prompt", form.initial_prompt.value.trim());
+  if (localUrl) URL.revokeObjectURL(localUrl);
+  localUrl = URL.createObjectURL(file);
+  $("#localPlayer").src = localUrl;
+  $("#jobBox").classList.remove("hidden");
+  $("#resultBox").classList.add("hidden");
+  const button = form.querySelector("button[type=submit]");
+  button.disabled = true;
+  try {
+    const summary = await api("/jobs", { method: "POST", body: data });
+    let job;
+    for (;;) {
+      job = await api(summary.status_url);
+      $("#jobProgress").style.width = `${Math.round(job.progress * 100)}%`;
+      $("#jobStatus").textContent = job.status === "queued" ? `Queued (${job.queue_position} ahead)`
+        : job.status === "processing" ? `${job.stage || "processing"} · ${Math.round(job.progress * 100)}%` : job.status;
+      if (job.status === "completed" || job.status === "failed") break;
+      await sleep(800);
+    }
+    if (job.status === "failed") throw new Error(job.error);
+    lastJob = job;
+    showTranscript(await api(summary.transcript_url), job);
+    $("#jobBox").classList.add("hidden");
+  } catch (e) { $("#jobStatus").textContent = ""; toast(e.message); }
+  finally { button.disabled = false; }
+};
+
+function showTranscript(t, job) {
+  $("#resultBox").classList.remove("hidden");
+  $("#resultMeta").textContent = `${t.language || "?"} · ${clock(t.duration_seconds)} · ${t.model}`;
+  const m = t.metrics;
+  $("#resultMetrics").textContent = m ? `Transcribed in ${m.inference_seconds}s (real-time factor ${m.real_time_factor}), peak memory ${m.peak_memory_mb} MB.` : "";
+  $("#resultSegments").replaceChildren(...t.segments.map(s =>
+    h("div", { class: "seg plain", onclick: () => { const a = $("#localPlayer"); a.currentTime = s.start; a.play(); } },
+      h("span", { class: "time" }, clock(s.start)), h("span", {}, s.text))));
+  $("#copyText").onclick = () => navigator.clipboard.writeText(t.text);
+}
+
+$$("[data-download]").forEach(b => b.onclick = async () => {
+  if (!lastJob) return;
+  try {
+    const blob = await api(`/jobs/${lastJob.id}/transcript?format=${b.dataset.download}`);
+    const ext = b.dataset.download === "text" ? "txt" : b.dataset.download;
+    const a = h("a", { href: URL.createObjectURL(blob), download: `${lastJob.filename.replace(/\.[^.]+$/, "")}.${ext}` });
+    a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  } catch (e) { toast(e.message); }
+});
+
+// ----------------------------------------------------------------- benchmark: recordings
+let sources = [], source = null, sel = null; // sel = {from, to} segment indexes
+let sourceUrl = null, stopAt = null, polling = null;
+const player = $("#sourcePlayer");
+
+async function refreshBenchmark() {
+  await Promise.all([loadSources(), loadClips(), loadModels(), loadRuns()]);
+}
+
+async function loadSources() {
+  try { sources = await api("/benchmark/sources"); } catch (e) { sources = []; }
+  $("#sources").replaceChildren(...sources.map(s =>
+    h("button", { class: "source", "aria-selected": String(source?.id === s.id), onclick: () => openSource(s.id) },
+      s.filename, " ", h("span", { class: `pill ${s.status === "failed" ? "bad" : s.status === "completed" ? "" : "good"}` },
+        s.status === "completed" ? clock(s.duration_seconds) : s.status))));
+}
+
+$("#sourceForm").onsubmit = async ev => {
+  ev.preventDefault();
+  const form = ev.target, data = new FormData(form);
+  const button = form.querySelector("button");
+  button.disabled = true;
+  try {
+    const s = await api("/benchmark/sources", { method: "POST", body: data });
+    form.reset(); form.language.value = defaultLanguage;
+    await loadSources();
+    openSource(s.id);
+  } catch (e) { toast(e.message); }
+  finally { button.disabled = false; }
+};
+
+async function openSource(id) {
+  clearTimeout(polling);
+  source = await api(`/benchmark/sources/${id}`);
+  sel = null;
+  $("#picker").classList.remove("hidden");
+  $("#pickerTitle").textContent = source.filename;
+  $$("#sources .source").forEach((b, i) => b.setAttribute("aria-selected", String(sources[i]?.id === id)));
+  if (source.status === "completed") { await showSource(); return; }
+  $("#sourceReady").classList.add("hidden");
+  $("#sourceWait").classList.remove("hidden");
+  if (source.status === "failed") {
+    $("#sourceStatus").textContent = `Transcription failed: ${source.error}`;
+    $("#sourceProgress").style.width = "0";
+    return;
+  }
+  try {
+    const job = await api(`/jobs/${source.job_id}`);
+    $("#sourceProgress").style.width = `${Math.round(job.progress * 100)}%`;
+    $("#sourceStatus").textContent = job.status === "queued" ? `Queued (${job.queue_position} ahead)` : `Whisper is proposing intervals… ${Math.round(job.progress * 100)}%`;
+  } catch { /* finished meanwhile */ }
+  polling = setTimeout(() => source && source.id === id && openSource(id), 1000);
+}
+
+async function showSource() {
+  $("#sourceWait").classList.add("hidden");
+  $("#sourceReady").classList.remove("hidden");
+  if (sourceUrl) URL.revokeObjectURL(sourceUrl);
+  const blob = await api(`/benchmark/sources/${source.id}/audio`);
+  sourceUrl = URL.createObjectURL(blob);
+  player.src = sourceUrl;
+  const d = source.duration_seconds || 1;
+  $("#axis").replaceChildren(...[0, .25, .5, .75, 1].map(f => h("span", {}, clock(d * f))));
+  renderSource();
+  loadSources();
+}
+
+function confColor(lp) {
+  if (lp == null) return "var(--line)";
+  return lp > -0.5 ? "var(--good)" : lp > -0.9 ? "var(--warn)" : "var(--bad)";
+}
+
+function renderSource() {
+  const segs = source.segments || [], d = source.duration_seconds || 1;
+  const inSel = i => sel && i >= sel.from && i <= sel.to;
+  const timeline = $("#timeline");
+  timeline.replaceChildren(
+    ...segs.map((s, i) => h("div", {
+      class: `block${inSel(i) ? " selected" : ""}`, title: `${clock(s.start)}–${clock(s.end)} ${s.text}`,
+      style: `left:${s.start / d * 100}%;width:${Math.max((s.end - s.start) / d * 100, .3)}%`,
+      onclick: ev => { ev.stopPropagation(); pick(i, ev.shiftKey); },
+    })),
+    h("div", { class: "range hidden", id: "range" }),
+    h("div", { class: "head", id: "head" }));
+  $("#sourceSegments").replaceChildren(...(segs.length ? segs.map((s, i) => h("div", {
+      class: `seg${inSel(i) ? " selected" : ""}`, onclick: ev => pick(i, ev.shiftKey),
+      title: s.avg_logprob == null ? "" : `confidence: mean log-probability ${s.avg_logprob}`,
+    }, h("input", { type: "checkbox", checked: inSel(i), onclick: ev => { ev.stopPropagation(); pick(i, true); } }),
+      h("span", { class: "time" }, h("span", { class: "conf", style: `background:${confColor(s.avg_logprob)}` }),
+        `${clock(s.start)}–${clock(s.end)}`),
+      h("span", {}, s.text))) : [h("div", { class: "seg plain muted" }, "", "Whisper found no speech in this recording.")]));
+  renderEditor();
+}
+
+function pick(i, extend) {
+  if (extend && sel) sel = { from: Math.min(sel.from, i), to: Math.max(sel.to, i) };
+  else sel = sel && sel.from === i && sel.to === i ? null : { from: i, to: i };
+  const segs = source.segments;
+  if (sel) {
+    $("#ivStart").value = segs[sel.from].start.toFixed(2);
+    $("#ivEnd").value = segs[sel.to].end.toFixed(2);
+    $("#ivText").value = segs.slice(sel.from, sel.to + 1).map(s => s.text).join(" ");
+    $("#ivName").value = "";
+    player.currentTime = segs[sel.from].start;
+  }
+  renderSource();
+}
+
+function interval() { return { start: parseFloat($("#ivStart").value), end: parseFloat($("#ivEnd").value) }; }
+
+function renderEditor() {
+  $("#editorEmpty").classList.toggle("hidden", !!sel);
+  $("#editorBody").classList.toggle("hidden", !sel);
+  updateRange();
+}
+
+function updateRange() {
+  const range = $("#range");
+  if (!range || !source) return;
+  const { start, end } = interval(), d = source.duration_seconds || 1;
+  const valid = sel && !isNaN(start) && !isNaN(end) && end > start;
+  range.classList.toggle("hidden", !valid);
+  if (valid) { range.style.left = `${start / d * 100}%`; range.style.width = `${(end - start) / d * 100}%`; }
+  $("#ivInfo").textContent = valid ? `${(end - start).toFixed(1)} s · ${$("#ivText").value.trim().split(/\s+/).filter(Boolean).length} words` : "";
+}
+["#ivStart", "#ivEnd", "#ivText"].forEach(id => $(id).addEventListener("input", updateRange));
+$$("[data-nudge]").forEach(b => b.onclick = () => {
+  const [which, delta] = b.dataset.nudge.split(":");
+  const input = $(which === "start" ? "#ivStart" : "#ivEnd");
+  input.value = Math.max(0, Math.min(source.duration_seconds, parseFloat(input.value || 0) + parseFloat(delta))).toFixed(2);
+  updateRange();
+});
+$("#startHere").onclick = () => { $("#ivStart").value = player.currentTime.toFixed(2); updateRange(); };
+$("#endHere").onclick = () => { $("#ivEnd").value = player.currentTime.toFixed(2); updateRange(); };
+$("#playInterval").onclick = () => {
+  const { start, end } = interval();
+  if (isNaN(start) || isNaN(end) || end <= start) return;
+  player.currentTime = start; stopAt = end; player.play();
+};
+$("#clearSel").onclick = () => { sel = null; renderSource(); };
+player.addEventListener("timeupdate", () => {
+  if (stopAt != null && player.currentTime >= stopAt) { player.pause(); stopAt = null; }
+  const head = $("#head");
+  if (head && source) head.style.left = `${player.currentTime / (source.duration_seconds || 1) * 100}%`;
+});
+player.addEventListener("pause", () => { if (stopAt != null && player.currentTime < stopAt - 0.3) stopAt = null; });
+$("#timeline").addEventListener("click", ev => {
+  if (!source?.duration_seconds) return;
+  const rect = ev.currentTarget.getBoundingClientRect();
+  player.currentTime = (ev.clientX - rect.left) / rect.width * source.duration_seconds;
+});
+
+$("#saveClip").onclick = async () => {
+  const { start, end } = interval();
+  const reference = $("#ivText").value.trim();
+  if (!reference) { toast("Write the correct transcript of the interval first."); return; }
+  const button = $("#saveClip");
+  button.disabled = true;
+  try {
+    await api("/benchmark/clips", { method: "POST", json: { source_id: source.id, start, end, reference, name: $("#ivName").value.trim() || null } });
+    sel = null; renderSource();
+    await loadClips();
+  } catch (e) { toast(e.message); }
+  finally { button.disabled = false; }
+};
+
+$("#retranscribe").onclick = async () => {
+  const language = $("#sourceForm").language.value;
+  try { await api(`/benchmark/sources/${source.id}/transcribe?language=${language}`, { method: "POST" }); openSource(source.id); }
+  catch (e) { toast(e.message); }
+};
+$("#deleteSource").onclick = async () => {
+  if (!confirm(`Delete ${source.filename}? Clips already saved from it are kept.`)) return;
+  try { await api(`/benchmark/sources/${source.id}`, { method: "DELETE" }); } catch (e) { toast(e.message); }
+  source = null; $("#picker").classList.add("hidden"); player.removeAttribute("src"); loadSources();
+};
+
+// ----------------------------------------------------------------- benchmark: clips
+let clips = [];
+const excluded = new Set(JSON.parse(store.get("excludedClips") || "[]"));
+const clipAudio = {};
+
+async function loadClips() {
+  try { clips = await api("/benchmark/clips"); } catch { clips = []; }
+  const total = clips.reduce((t, c) => t + c.duration_seconds, 0);
+  $("#clipCount").textContent = `${clips.length} · ${clock(total)}`;
+  $("#clips").replaceChildren(...(clips.length ? clips.map(c => h("tr", {},
+    h("td", {}, h("input", { type: "checkbox", checked: !excluded.has(c.id), title: "Use in runs",
+      onchange: ev => { ev.target.checked ? excluded.delete(c.id) : excluded.add(c.id); store.set("excludedClips", JSON.stringify([...excluded])); } })),
+    h("td", {}, h("div", {}, c.name), h("div", { class: "muted", style: "font-size:12px" },
+      c.source_filename ? `${c.source_filename} ${clock(c.start)}–${clock(c.end)}` : "imported")),
+    h("td", { class: "num" }, `${c.duration_seconds.toFixed(1)} s`),
+    h("td", { style: "width:55%" }, h("textarea", { class: "clip-ref", rows: 2,
+      onchange: async ev => {
+        try { await api(`/benchmark/clips/${c.id}`, { method: "PATCH", json: { reference: ev.target.value } }); c.reference = ev.target.value; }
+        catch (e) { toast(e.message); ev.target.value = c.reference; }
+      } }, c.reference)),
+    h("td", { style: "white-space:nowrap" },
+      h("button", { class: "small", title: "Play", onclick: () => playClip(c.id) }, "▶"), " ",
+      h("button", { class: "small danger", title: "Delete", onclick: async () => {
+        if (!confirm(`Delete clip "${c.name}"?`)) return;
+        try { await api(`/benchmark/clips/${c.id}`, { method: "DELETE" }); loadClips(); } catch (e) { toast(e.message); }
+      } }, "✕"))))
+    : [h("tr", {}, h("td", { colspan: 5, class: "muted" }, "No reference clips yet: pick intervals from a recording above."))]));
+}
+
+async function playClip(id) {
+  const audio = $("#clipPlayer");
+  try {
+    clipAudio[id] ||= URL.createObjectURL(await api(`/benchmark/clips/${id}/audio`));
+    if (audio.dataset.clip === id && !audio.paused) { audio.pause(); return; }
+    audio.src = clipAudio[id]; audio.dataset.clip = id; audio.play();
+  } catch (e) { toast(e.message); }
+}
+
+$("#importForm").onsubmit = async ev => {
+  ev.preventDefault();
+  try { await api("/benchmark/clips/upload", { method: "POST", body: new FormData(ev.target) }); ev.target.reset(); loadClips(); }
+  catch (e) { toast(e.message); }
+};
+
+// ----------------------------------------------------------------- benchmark: run
+async function loadModels() {
+  try {
+    const [models, variants] = await Promise.all([api("/benchmark/models"), api("/benchmark/variants")]);
+    $("#models").replaceChildren(...(models.length ? models.map(m => h("label", { class: "check" },
+      h("input", { type: "checkbox", value: m.id, checked: m.default }), m.name,
+      m.name !== m.id ? h("span", { class: "muted mono" }, m.id) : null, m.default ? h("span", { class: "pill" }, "in use") : null))
+      : [h("span", { class: "muted" }, "No model loaded.")]));
+    $("#variants").replaceChildren(...variants.map(v => h("label", { class: "check" },
+      h("input", { type: "checkbox", value: v.id, checked: true }), v.label)));
+  } catch (e) { $("#models").textContent = e.message; }
+}
+
+$("#runBenchmark").onclick = async () => {
+  $("#runError").textContent = "";
+  const models = $$("#models input:checked").map(i => i.value);
+  const variants = $$("#variants input:checked").map(i => i.value);
+  const clipIds = clips.filter(c => !excluded.has(c.id)).map(c => c.id);
+  if (!models.length || !variants.length) { $("#runError").textContent = "Choose at least one model and one decoding variant."; return; }
+  if (!clipIds.length) { $("#runError").textContent = "Add (or tick) at least one reference clip."; return; }
+  try {
+    const run = await api("/benchmarks", { method: "POST", json: {
+      models, variants, language: $("#runLanguage").value, initial_prompt: $("#runPrompt").value.trim() || null, clip_ids: clipIds } });
+    currentRun = run.id;
+    await loadRuns();
+  } catch (e) { $("#runError").textContent = e.message; }
+};
+
+// ----------------------------------------------------------------- benchmark: results
+let runs = [], currentRun = null, runPolling = null, openRow = null;
+
+async function loadRuns() {
+  try { runs = await api("/benchmarks"); } catch { runs = []; }
+  if (!currentRun && runs.length) currentRun = runs[0].id;
+  $("#runs").replaceChildren(...runs.map(r => h("button", {
+    class: "source", "aria-selected": String(r.id === currentRun), onclick: () => { currentRun = r.id; openRow = null; loadRuns(); } },
+    new Date(r.created_at).toLocaleString([], { dateStyle: "short", timeStyle: "short" }), " ",
+    h("span", { class: `pill ${r.status === "failed" ? "bad" : r.status === "completed" ? "good" : ""}` }, r.status))));
+  if (currentRun) showRun(currentRun); else $("#runView").replaceChildren(h("p", { class: "muted" }, "No runs yet."));
+}
+
+async function showRun(id, polled = false) {
+  clearTimeout(runPolling);
+  let run;
+  try { run = await api(`/benchmarks/${id}`); } catch (e) { $("#runView").textContent = e.message; return; }
+  const active = run.status === "queued" || run.status === "processing";
+  if (polled && !active) { loadRuns(); return; } // just finished: refresh the run list too
+  const view = [];
+  const p = run.progress;
+  if (active) {
+    view.push(h("div", { class: "progress" }, h("div", { style: `width:${p.total ? p.done / p.total * 100 : 0}%` })),
+      h("p", { class: "muted" }, run.status === "queued" ? "Waiting for the transcription queue…" : `${p.done}/${p.total} · ${p.current || ""}`));
+    runPolling = setTimeout(() => currentRun === id && showRun(id, true), 1000);
+  }
+  if (run.error) view.push(h("p", { class: "error" }, run.error));
+  view.push(h("p", { class: "muted", style: "font-size:13px" },
+    `${run.clip_ids.length} clips · language ${run.language}${run.initial_prompt ? ` · prompt “${run.initial_prompt}”` : ""}`));
+
+  const scored = run.results.filter(r => r.wer != null);
+  // Highlight the lowest WER only when it actually beats something.
+  const best = new Set(scored.map(r => r.wer)).size > 1 ? Math.min(...scored.map(r => r.wer)) : null;
+  const rows = [];
+  run.results.forEach((r, i) => {
+    const key = `${r.model}|${r.variant}`;
+    rows.push(h("tr", { class: `clickable${r.wer === best ? " best" : ""}`, onclick: () => { openRow = openRow === key ? null : key; showRun(id); } },
+      h("td", {}, r.model_name || r.model, h("div", { class: "muted mono" }, r.model)),
+      h("td", {}, variantLabel(r.variant)),
+      r.error ? h("td", { colspan: 7, class: "error" }, r.error) : [
+        h("td", { class: "num" }, h("strong", {}, pct(r.wer)), h("span", { class: "werbar", style: `width:${Math.min(r.wer || 0, 1) * 70}px` })),
+        h("td", { class: "num" }, r.substitutions), h("td", { class: "num" }, r.deletions), h("td", { class: "num" }, r.insertions),
+        h("td", { class: "num" }, r.real_time_factor ?? "–"), h("td", { class: "num" }, r.peak_memory_mb ?? "–"),
+        h("td", { class: "num" }, r.load_seconds ?? "in use")]));
+    if (openRow === key && r.clips.length) {
+      rows.push(h("tr", {}, h("td", { colspan: 9 }, ...[...r.clips].sort((a, b) => b.wer - a.wer).map(c => h("div", { class: "clipres" },
+        h("h4", {}, h("span", { class: `pill ${c.wer === 0 ? "good" : c.wer > 0.2 ? "bad" : ""}` }, pct(c.wer)), c.name,
+          h("span", { class: "muted", style: "font-weight:400" }, `${c.errors}/${c.reference_words} words wrong · ${c.inference_seconds}s`),
+          h("button", { class: "small", onclick: ev => { ev.stopPropagation(); playClip(c.clip_id); } }, "▶")),
+        diff(c.alignment))))));
+    }
+  });
+  if (run.results.length) {
+    view.push(h("div", { class: "scroll" }, h("table", {},
+      h("thead", {}, h("tr", {}, h("th", {}, "Model"), h("th", {}, "Decoding"), h("th", { class: "num" }, "WER"),
+        h("th", { class: "num", title: "Wrong words" }, "Sub"), h("th", { class: "num", title: "Missing words" }, "Del"),
+        h("th", { class: "num", title: "Extra words" }, "Ins"), h("th", { class: "num" }, "RTF"),
+        h("th", { class: "num" }, "Peak MB"), h("th", { class: "num" }, "Load s"))),
+      h("tbody", {}, rows))));
+  }
+  if (run.status === "completed" || run.status === "failed") {
+    view.push(h("div", { style: "margin-top:10px" }, h("button", { class: "small danger", onclick: async () => {
+      if (!confirm("Delete this run?")) return;
+      try { await api(`/benchmarks/${id}`, { method: "DELETE" }); currentRun = null; loadRuns(); } catch (e) { toast(e.message); }
+    } }, "Delete run")));
+  }
+  $("#runView").replaceChildren(...view);
+}
+
+let variantLabels = {};
+function variantLabel(id) { return variantLabels[id] || id; }
+api("/benchmark/variants").then(vs => vs.forEach(v => variantLabels[v.id] = v.label)).catch(() => {});
+
+function diff(alignment) {
+  const parts = [];
+  for (const [op, ref, hyp] of alignment) {
+    if (op === "ok") parts.push(ref);
+    else if (op === "sub") parts.push(h("span", { class: "sub", title: `said “${ref}”, transcribed “${hyp}”` }, h("del", {}, ref), h("ins", {}, hyp)));
+    else if (op === "del") parts.push(h("del", { title: "missing in the transcript" }, ref));
+    else parts.push(h("ins", { title: "not in the reference" }, hyp));
+    parts.push(" ");
+  }
+  return h("div", { class: "diff" }, parts);
+}
+
+// ----------------------------------------------------------------- start
+function refreshAll() {
+  refreshHealth();
+  if (!$("#tab-benchmark").classList.contains("hidden")) refreshBenchmark();
+}
+refreshHealth().then(() => showTab(store.get("tab") === "benchmark" ? "benchmark" : "transcribe"));
+</script>
+</body>
+</html>

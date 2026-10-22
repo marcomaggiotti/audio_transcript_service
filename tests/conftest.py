@@ -26,11 +26,13 @@ class FakeTranscriber:
         self.error = error
         self.calls = 0
         self.languages = []
+        self.options = []  # DecodingOptions of each call
         self.gate: threading.Event | None = None  # set by a test to hold transcriptions until released
 
-    def transcribe(self, audio, language=None, on_progress=None):
+    def transcribe(self, audio, language=None, on_progress=None, options=None):
         self.calls += 1
         self.languages.append(language)
+        self.options.append(options)
         if on_progress:
             on_progress(0.5)  # as if half the windows were done
         if self.gate is not None:
@@ -59,6 +61,9 @@ def make_wav(seconds=1.0, rate=16000, channels=1, freq=440.0) -> bytes:
 def settings(tmp_path):
     return Settings(
         upload_dir=str(tmp_path / "uploads"),
+        benchmark_dir=str(tmp_path / "benchmark"),
+        models_dir=str(tmp_path / "models"),
+        whisper_model_dir=str(tmp_path / "models" / "whisper-tiny"),
         default_language="auto",
         max_upload_mb=1,
         max_audio_seconds=60,

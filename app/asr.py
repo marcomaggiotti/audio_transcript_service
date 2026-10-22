@@ -14,11 +14,14 @@ Expects the directory layout produced by scripts/export_whisper_onnx.py (optimum
 Decoding is greedy with Whisper's timestamp rules, so every transcript comes back as
 segments with start/end times. Long audio is processed in 30 s windows that advance
 to the last complete timestamp, the same "seek" strategy openai/whisper uses.
+DecodingOptions adds openai/whisper's temperature fallback (re-decode a window whose text
+repeats or is unsure), prompting with the previous text, and an initial prompt.
 """
 
 import json
 import logging
 import os
+import zlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,6 +41,26 @@ logger = logging.getLogger(__name__)
 
 TIME_PRECISION = 0.02  # seconds per timestamp token
 MAX_INITIAL_TIMESTAMP = 1.0  # first segment must start within 1 s of the window
+N_TEXT_CTX = 448  # decoder positions: prompt + sampled tokens must fit
+MAX_PROMPT_TOKENS = N_TEXT_CTX // 2 - 1  # previous-text tokens kept in the prompt (as openai/whisper)
+
+# Temperature fallback, with openai/whisper's thresholds: a window is decoded again, sampling at the
+# next temperature, when its text compresses too well (repetition loop) or its tokens are unsure.
+FALLBACK_TEMPERATURES = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+COMPRESSION_RATIO_THRESHOLD = 2.4
+LOGPROB_THRESHOLD = -1.0
+# With fallback on, a window Whisper thinks is silent (and whose text is unsure) produces no segments.
+NO_SPEECH_THRESHOLD = 0.6
+
+
+@dataclass(frozen=True)
+class DecodingOptions:
+    """How each 30 s window is decoded. The defaults are plain greedy decoding."""
+
+    temperature_fallback: bool = False  # re-decode a window at rising temperatures when its text looks wrong
+    condition_on_previous_text: bool = False  # prompt each window with the text decoded before it
+    initial_prompt: str | None = None  # vocabulary or style hint, prompted on every window
+    seed: int = 0  # for the sampled (temperature > 0) attempts, so runs are repeatable
 
 
 @dataclass
@@ -48,6 +71,7 @@ class Segment:
     # How sure Whisper was (None from transcribers that don't measure it):
     avg_logprob: float | None = None  # mean log-probability of the segment's text tokens
     no_speech_prob: float | None = None  # Whisper's estimate that its 30 s window is silence
+    tokens: list[int] = field(default_factory=list, repr=False, compare=False)  # text token ids
 
 
 @dataclass
@@ -60,11 +84,21 @@ class TranscriptionResult:
         return " ".join(s.text for s in self.segments).strip()
 
 
+@dataclass
+class WindowResult:
+    segments: list[Segment]  # relative to the window
+    consumed: float  # seconds of the window covered by the segments
+    avg_logprob: float
+    compression_ratio: float
+    temperature: float
+
+
 class Transcriber(Protocol):
     name: str
 
     def transcribe(self, audio: np.ndarray, language: str | None = None,
-                   on_progress: Callable[[float], None] | None = None) -> TranscriptionResult: ...
+                   on_progress: Callable[[float], None] | None = None,
+                   options: DecodingOptions | None = None) -> TranscriptionResult: ...
 
 
 class ModelLoadError(RuntimeError):
@@ -83,6 +117,7 @@ class WhisperTokens:
     lang_to_id: dict[str, int]
     suppress: list[int]
     no_speech: int | None = None  # <|nospeech|> (<|nocaptions|> in older checkpoints)
+    prev: int | None = None  # <|startofprev|>: starts the previous-text prompt
 
     @property
     def multilingual(self) -> bool:
@@ -119,6 +154,7 @@ def _resolve_tokens(tokenizer, generation_config: dict) -> WhisperTokens:
         lang_to_id=lang_to_id,
         suppress=[t for t in generation_config.get("suppress_tokens", []) if t >= 0],
         no_speech=tid("<|nospeech|>") if tid("<|nospeech|>") is not None else tid("<|nocaptions|>"),
+        prev=tid("<|startofprev|>"),
     )
 
 
@@ -193,8 +229,13 @@ class OnnxWhisperTranscriber:
     # ------------------------------------------------------------------ public
 
     def transcribe(self, audio: np.ndarray, language: str | None = None,
-                   on_progress: Callable[[float], None] | None = None) -> TranscriptionResult:
+                   on_progress: Callable[[float], None] | None = None,
+                   options: DecodingOptions | None = None) -> TranscriptionResult:
         """`on_progress` gets the share of the audio transcribed (0-1) after each 30 s window."""
+        options = options or DecodingOptions()
+        rng = np.random.default_rng(options.seed)
+        initial = self._encode_prompt(options.initial_prompt)
+        previous: list[int] = []  # text tokens of the windows decoded so far, for the next prompt
         duration = audio.shape[0] / SAMPLE_RATE
         segments: list[Segment] = []
         detected: str | None = None
@@ -221,14 +262,26 @@ class OnnxWhisperTranscriber:
                 detected = detected or lang
             no_speech = self._no_speech_prob(sot_logits)
 
-            window_segments, consumed = self._decode_window(encoded, lang, window_seconds)
-            for seg in window_segments:
-                start = min(offset + seg.start, duration)
-                end = min(offset + seg.end, duration)
-                if seg.text and end > start:
-                    segments.append(Segment(round(start, 2), round(end, 2), seg.text,
-                                            seg.avg_logprob, no_speech))
-            seek += max(int(consumed * SAMPLE_RATE), SAMPLE_RATE)  # always move forward
+            result = self._decode_with_fallback(encoded, lang, window_seconds, initial + previous,
+                                                no_speech, options, rng)
+            silent = (options.temperature_fallback and no_speech is not None and no_speech > NO_SPEECH_THRESHOLD
+                      and result.avg_logprob < LOGPROB_THRESHOLD)
+            if silent:  # Whisper's no-speech skip: drop the window's text, move past the whole window
+                result.consumed = window_seconds
+                previous = []
+            else:
+                for seg in result.segments:
+                    start = min(offset + seg.start, duration)
+                    end = min(offset + seg.end, duration)
+                    if seg.text and end > start:
+                        segments.append(Segment(round(start, 2), round(end, 2), seg.text,
+                                                seg.avg_logprob, no_speech, seg.tokens))
+                # Text sampled at a high temperature is a poor guide for the next window (as openai/whisper).
+                if options.condition_on_previous_text and result.temperature <= 0.5:
+                    previous = (previous + [t for seg in result.segments for t in seg.tokens])[-MAX_PROMPT_TOKENS:]
+                else:
+                    previous = []
+            seek += max(int(result.consumed * SAMPLE_RATE), SAMPLE_RATE)  # always move forward
             if on_progress:
                 on_progress(min(1.0, seek / audio.shape[0]))
 
@@ -254,7 +307,13 @@ class OnnxWhisperTranscriber:
 
     # ---------------------------------------------------------------- decoding
 
-    def _prompt(self, language: str | None) -> list[int]:
+    def _encode_prompt(self, text: str | None) -> list[int]:
+        if not text or not text.strip() or self.tokens.prev is None:
+            return []
+        ids = self.tokenizer.encode(" " + text.strip(), add_special_tokens=False).ids
+        return [t for t in ids if t < self.tokens.eot][-MAX_PROMPT_TOKENS:]
+
+    def _prompt(self, language: str | None, previous: list[int] | None = None) -> list[int]:
         prompt = [self.tokens.sot]
         if self.tokens.multilingual:
             lang_id = self.tokens.lang_to_id.get(language or "en")
@@ -263,6 +322,8 @@ class OnnxWhisperTranscriber:
             prompt.append(lang_id)
             if self.tokens.transcribe is not None:
                 prompt.append(self.tokens.transcribe)
+        if previous and self.tokens.prev is not None:
+            prompt = [self.tokens.prev, *previous[-MAX_PROMPT_TOKENS:], *prompt]
         return prompt
 
     def _next_logits(self, tokens: list[int], encoded: np.ndarray) -> np.ndarray:
@@ -305,22 +366,50 @@ class OnnxWhisperTranscriber:
             return logits[0, -1].astype(np.float32)
         return cached
 
-    def _decode_window(self, encoded: np.ndarray, language: str | None,
-                       window_seconds: float) -> tuple[list[Segment], float]:
-        """Decode one 30 s window. Returns segments relative to the window and the seconds consumed."""
-        prompt = self._prompt(language)
+    def _decode_with_fallback(self, encoded: np.ndarray, language: str | None, window_seconds: float,
+                              previous: list[int], no_speech: float | None, options: DecodingOptions,
+                              rng: np.random.Generator) -> WindowResult:
+        temperatures = FALLBACK_TEMPERATURES if options.temperature_fallback else (0.0,)
+        for temperature in temperatures:
+            result = self._decode_window(encoded, language, window_seconds, previous, temperature, rng)
+            looks_wrong = (result.compression_ratio > COMPRESSION_RATIO_THRESHOLD
+                           or result.avg_logprob < LOGPROB_THRESHOLD)
+            if not looks_wrong or (no_speech is not None and no_speech > NO_SPEECH_THRESHOLD):
+                break  # good enough, or silence (skipped by the caller, retrying won't help)
+        return result
+
+    def _decode_window(self, encoded: np.ndarray, language: str | None, window_seconds: float,
+                       previous: list[int] | None = None, temperature: float = 0.0,
+                       rng: np.random.Generator | None = None) -> WindowResult:
+        """Decode one 30 s window: greedy at temperature 0, otherwise sampled."""
+        prompt = self._prompt(language, previous)
         tokens = list(prompt)
         logprobs: list[float] = []  # of each chosen token, after the filters (as Whisper scores them)
         next_logits = self._decoder_session(encoded)
-        for _ in range(self.max_new_tokens):
+        for _ in range(min(self.max_new_tokens, N_TEXT_CTX - len(prompt))):
             logits = next_logits(tokens)
             self._apply_rules(logits, tokens[len(prompt):])
-            next_token = int(np.argmax(logits))
-            logprobs.append(float(logits[next_token] - np.logaddexp.reduce(logits[np.isfinite(logits)])))
+            finite = np.isfinite(logits)
+            if temperature > 0:
+                scaled = np.where(finite, logits / temperature, -np.inf)
+                probs = np.exp(scaled - scaled[finite].max())
+                next_token = int((rng or np.random.default_rng()).choice(probs.shape[0], p=probs / probs.sum()))
+            else:
+                next_token = int(np.argmax(logits))
+            logprobs.append(float(logits[next_token] - np.logaddexp.reduce(logits[finite])))
             tokens.append(next_token)
             if next_token == self.tokens.eot:
                 break
-        return self._split_segments(tokens[len(prompt):], window_seconds, logprobs)
+        sampled = tokens[len(prompt):]
+        segments, consumed = self._split_segments(sampled, window_seconds, logprobs)
+        text = self._decode_text([t for t in sampled if t < self.tokens.eot]).encode()
+        return WindowResult(
+            segments=segments,
+            consumed=consumed,
+            avg_logprob=sum(logprobs) / len(logprobs) if logprobs else 0.0,
+            compression_ratio=len(text) / len(zlib.compress(text)) if text else 0.0,
+            temperature=temperature,
+        )
 
     def _apply_rules(self, logits: np.ndarray, sampled: list[int]) -> None:
         """Whisper's logit filters: suppress specials and enforce well-formed timestamp pairs."""
@@ -381,7 +470,8 @@ class OnnxWhisperTranscriber:
                 if start is None:
                     start, text_ids, text_lps = time, [], []
                 else:
-                    segments.append(Segment(start, time, self._decode_text(text_ids), mean(text_lps)))
+                    segments.append(Segment(start, time, self._decode_text(text_ids), mean(text_lps),
+                                            tokens=text_ids))
                     last_end, start = time, None
             elif start is not None:
                 text_ids.append(tok)
@@ -390,7 +480,8 @@ class OnnxWhisperTranscriber:
         if start is not None and text_ids:
             # Unclosed trailing segment: keep it if the model finished, otherwise re-decode from there.
             if finished or not segments:
-                segments.append(Segment(start, window_seconds, self._decode_text(text_ids), mean(text_lps)))
+                segments.append(Segment(start, window_seconds, self._decode_text(text_ids), mean(text_lps),
+                                        tokens=text_ids))
                 return segments, window_seconds
             return segments, last_end
 

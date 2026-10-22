@@ -2,20 +2,21 @@
 
 Jobs run on an in-process asyncio queue; the CPU-bound work runs in worker threads and
 `concurrency` bounds how many inferences run at once (Whisper's memory peak is per job).
-Synchronous requests go through the same queue, so they are bounded the same way.
+Synchronous requests and benchmark runs go through the same queue, so they are bounded the same way.
 Job state lives in memory: a restart forgets it, and the uploads waiting in the queue are removed.
 """
 
 import asyncio
+import functools
 import logging
-import resource
-import sys
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from pathlib import Path
 
-from app.asr import Transcriber
+from app.asr import DecodingOptions, Transcriber
 from app.audio import InvalidAudioError, decode_audio, duration_seconds
+from app.metrics import peak_memory_mb
 from app.schemas import InferenceMetrics, Job, JobStatus, Transcript, TranscriptSegment, utcnow
 
 logger = logging.getLogger(__name__)
@@ -27,12 +28,6 @@ class QueueFullError(RuntimeError):
 
 class JobNotFound(KeyError):
     pass
-
-
-def peak_memory_mb() -> float:
-    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    # Linux reports KiB, macOS reports bytes.
-    return round(peak / (1024 * 1024) if sys.platform == "darwin" else peak / 1024, 1)
 
 
 class TranscriptionService:
@@ -48,6 +43,7 @@ class TranscriptionService:
         self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=max_queue_size)
         self.jobs: OrderedDict[str, Job] = OrderedDict()
         self._finished: dict[str, asyncio.Event] = {}
+        self._tasks: dict[str, Callable[[], None]] = {}  # queued work that isn't a transcription job
         self._workers: list[asyncio.Task] = []
         self.active = 0  # jobs currently being transcribed
 
@@ -114,6 +110,15 @@ class TranscriptionService:
         self._finished.pop(job_id, None)
         self.upload_path(job_id).unlink(missing_ok=True)
 
+    def submit_task(self, task_id: str, run: Callable[[], None]) -> None:
+        """Queue other inference work (a benchmark run) behind the jobs, on the same workers."""
+        self._tasks[task_id] = run
+        try:
+            self.queue.put_nowait(task_id)
+        except asyncio.QueueFull as e:
+            del self._tasks[task_id]
+            raise QueueFullError("Transcription queue is full, try again later") from e
+
     async def wait(self, job_id: str) -> Job:
         """Wait until the job is completed or failed and return it."""
         job = self.get(job_id)
@@ -129,10 +134,11 @@ class TranscriptionService:
     async def _worker(self, worker_id: int) -> None:
         while True:
             job_id = await self.queue.get()
+            task = self._tasks.pop(job_id, None)
             try:
                 self.active += 1
                 try:
-                    await asyncio.to_thread(self.process, job_id)
+                    await asyncio.to_thread(task or functools.partial(self.process, job_id))
                 finally:
                     self.active -= 1
             except Exception:  # process() records failures itself; never kill the worker
@@ -172,7 +178,11 @@ class TranscriptionService:
             def progress(share: float) -> None:
                 job.progress = round(share, 3)
 
-            result = self.transcriber.transcribe(audio, language=job.language, on_progress=progress)
+            options = DecodingOptions(temperature_fallback=job.temperature_fallback,
+                                      condition_on_previous_text=job.condition_on_previous_text,
+                                      initial_prompt=job.initial_prompt)
+            result = self.transcriber.transcribe(audio, language=job.language, on_progress=progress,
+                                                 options=options)
             t2 = time.perf_counter()
         except Exception as e:
             logger.exception("Transcription failed for %s", job_id)

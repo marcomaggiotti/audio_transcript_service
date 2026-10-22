@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.asr import OnnxWhisperTranscriber  # noqa: E402
 from app.audio import decode_audio, duration_seconds  # noqa: E402
-from app.jobs import peak_memory_mb  # noqa: E402
+from app.metrics import peak_memory_mb  # noqa: E402
 
 
 def main() -> None:

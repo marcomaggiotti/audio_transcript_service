@@ -28,6 +28,17 @@ class Settings(BaseModel):
     onnx_threads: int = int(_env("ONNX_THREADS", "0"))  # 0 = let ONNX Runtime decide
     # Skip ONNX Runtime's pre-packed weight copies: ~25 MB less RAM, decoder steps ~2x slower.
     whisper_low_memory: bool = _flag("WHISPER_LOW_MEMORY")
+    # Decoding defaults (a request can override them): openai/whisper's temperature fallback, and
+    # prompting each 30 s window with the text before it. INITIAL_PROMPT: vocabulary/style hint.
+    temperature_fallback: bool = _flag("TEMPERATURE_FALLBACK", "true")
+    condition_on_previous_text: bool = _flag("CONDITION_ON_PREVIOUS_TEXT", "true")
+    initial_prompt: str | None = _env("INITIAL_PROMPT")
+
+    # Benchmark tab: every subdirectory of MODELS_DIR holding an export can be compared.
+    models_dir: str = _env("MODELS_DIR", "./models")
+    # Reference recordings, clips (interval audio + correct transcript) and finished runs.
+    benchmark_dir: str = _env("BENCHMARK_DIR", "./data/benchmark")
+    max_clip_seconds: int = int(_env("MAX_CLIP_SECONDS", "300"))
 
     # Shared secret for the transcription endpoints. Empty = no auth.
     api_token: str | None = _env("API_TOKEN")

@@ -5,11 +5,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from app.asr import ModelLoadError, OnnxWhisperTranscriber, WhisperTokens
+from app.asr import DecodingOptions, ModelLoadError, OnnxWhisperTranscriber, WhisperTokens
 
 # Tiny vocabulary: 0-9 text, then specials, then timestamps (0.02 s each).
 WORDS = ["hello", "world", "onnx", "runtime", "bye", "x5", "x6", "x7", "x8", "x9"]
 EOT, SOT, EN, DE, TRANSCRIBE, NO_TS = 10, 11, 12, 13, 14, 15
+PREV = 9  # stands in for <|startofprev|>; the scripted decoder only needs SOT to find the prompt
 TS = 16
 VOCAB = TS + 1501
 
@@ -21,6 +22,9 @@ def ts(seconds: float) -> int:
 class FakeTokenizer:
     def decode(self, ids, skip_special_tokens=True):
         return " ".join(WORDS[i] for i in ids if i < 10)
+
+    def encode(self, text, add_special_tokens=True):
+        return SimpleNamespace(ids=[WORDS.index(w) for w in text.split() if w in WORDS])
 
 
 class FakeEncoder:
@@ -39,10 +43,13 @@ class FakeEncoder:
 class ScriptedDecoder:
     """Returns logits that prefer the next token of a per-window script."""
 
-    def __init__(self, scripts, prompt_len=3, language_scores=None):
+    def __init__(self, scripts, prompt_len=3, language_scores=None, strength=10.0):
         self.scripts = scripts
         self.prompt_len = prompt_len
         self.language_scores = language_scores or {}
+        self.strength = strength  # logit of the scripted token against zeros (lower = less sure)
+        self.prompts: list[list[int]] = []  # every decoding attempt's prompt
+        self.attempts: dict[int, int] = {}
 
     def get_inputs(self):
         return [SimpleNamespace(name="input_ids"), SimpleNamespace(name="encoder_hidden_states")]
@@ -55,16 +62,22 @@ class ScriptedDecoder:
             for token, score in self.language_scores.items():
                 logits[token] = score
         else:
+            prompt = ids[: ids.index(SOT) + self.prompt_len]  # previous-text prompt included
+            step = len(ids) - len(prompt)
+            if step == 0:  # first step of a decoding attempt
+                self.prompts.append(prompt)
+                self.attempts[window] = self.attempts.get(window, -1) + 1
             script = self.scripts[window]
-            step = len(ids) - self.prompt_len
-            logits[script[step] if step < len(script) else EOT] = 10.0
+            if script and isinstance(script[0], list):  # one script per fallback attempt
+                script = script[min(self.attempts[window], len(script) - 1)]
+            logits[script[step] if step < len(script) else EOT] = self.strength
         return [logits[None, None, :]]
 
 
 def make(scripts, multilingual=True, **kw):
     tokens = WhisperTokens(
         eot=EOT, sot=SOT, transcribe=TRANSCRIBE, no_timestamps=NO_TS, timestamp_begin=TS,
-        lang_to_id={"en": EN, "de": DE} if multilingual else {}, suppress=[],
+        lang_to_id={"en": EN, "de": DE} if multilingual else {}, suppress=[], prev=PREV,
     )
     decoder = ScriptedDecoder(scripts, prompt_len=3 if multilingual else 1, **kw)
     return OnnxWhisperTranscriber(FakeEncoder(), decoder, FakeTokenizer(), tokens)
@@ -141,3 +154,57 @@ def test_progress_after_each_window():
     seen = []
     make([first, second]).transcribe(np.zeros(16000 * 40, dtype=np.float32), "en", on_progress=seen.append)
     assert seen[0] == pytest.approx(30 / 40) and seen[-1] == 1.0
+
+
+def test_greedy_by_default_decodes_each_window_once():
+    t = make([[ts(0), 0, ts(1.0), EOT]])
+    t.transcribe(np.zeros(16000 * 2, dtype=np.float32), "en")
+    assert t.decoder.attempts == {0: 0}
+
+
+def test_temperature_fallback_redecodes_a_repetition_loop():
+    loop = [ts(0)] + [0] * 60 + [ts(5.0), EOT]  # "hello hello hello ...": compresses far too well
+    good = [ts(0), 2, 3, ts(5.0), EOT]
+    audio = np.zeros(16000 * 6, dtype=np.float32)
+
+    greedy = make([[loop, good]]).transcribe(audio, "en")
+    assert greedy.segments[0].text.startswith("hello hello")
+
+    t = make([[loop, good]])
+    fixed = t.transcribe(audio, "en", options=DecodingOptions(temperature_fallback=True))
+    assert [s.text for s in fixed.segments] == ["onnx runtime"]
+    assert t.decoder.attempts == {0: 1}  # second attempt (temperature 0.2) was good enough
+
+
+def test_fallback_skips_silent_unsure_windows():
+    NOSPEECH = 8
+    audio = np.zeros(16000 * 3, dtype=np.float32)
+    options = DecodingOptions(temperature_fallback=True)
+    # Weak logits make every token unsure (avg log-prob well below -1); no-speech dominates the first step.
+    t = make([[ts(0), 0, ts(1.0), EOT]], language_scores={NOSPEECH: 10.0}, strength=4.0)
+    t.tokens.no_speech = NOSPEECH
+    assert t.transcribe(audio, "en", options=options).segments == []
+    assert t.decoder.attempts == {0: 0}  # silence: no retries
+    t = make([[ts(0), 0, ts(1.0), EOT]], language_scores={NOSPEECH: 10.0}, strength=4.0)
+    t.tokens.no_speech = NOSPEECH
+    assert [s.text for s in t.transcribe(audio, "en").segments] == ["hello"]  # greedy keeps it
+
+
+def test_previous_text_is_prompted_on_the_next_window():
+    first = [ts(0), 0, 1, ts(29.0), EOT]
+    second = [ts(0), 2, ts(3.0), EOT]
+    t = make([first, second])
+    t.transcribe(np.zeros(16000 * 40, dtype=np.float32), "en",
+                 options=DecodingOptions(condition_on_previous_text=True))
+    assert t.decoder.prompts == [[SOT, EN, TRANSCRIBE], [PREV, 0, 1, SOT, EN, TRANSCRIBE]]
+
+    t = make([first, second])
+    t.transcribe(np.zeros(16000 * 40, dtype=np.float32), "en")
+    assert t.decoder.prompts == [[SOT, EN, TRANSCRIBE]] * 2
+
+
+def test_initial_prompt_on_every_window():
+    t = make([[ts(0), 2, ts(29.0), EOT], [ts(0), 4, ts(2.0), EOT]])
+    t.transcribe(np.zeros(16000 * 40, dtype=np.float32), "en",
+                 options=DecodingOptions(initial_prompt="onnx runtime", condition_on_previous_text=True))
+    assert t.decoder.prompts == [[PREV, 2, 3, SOT, EN, TRANSCRIBE], [PREV, 2, 3, 2, SOT, EN, TRANSCRIBE]]
