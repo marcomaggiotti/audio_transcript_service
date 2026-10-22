@@ -33,7 +33,7 @@ This service keeps only that part. It has no search, embeddings or storage.
 | `POST` | `/transcribe?format=json\|text\|srt\|vtt` | Multipart `file` (WAV, MP3, OGG/Opus, M4A, FLAC) and optional `language` (`en`, `de`, `it`, … or `auto`). Waits and returns the transcript |
 | `POST` | `/jobs` | Same upload, transcribed in the background. Returns `202` with the job id, `status_url` and `transcript_url` |
 | `GET` | `/jobs` | Recent jobs, newest first |
-| `GET` | `/jobs/{id}` | Status, model, timings and metrics, or the error if it failed |
+| `GET` | `/jobs/{id}` | Status, `stage` (decoding, transcribing), `progress` (0–1, updated after each 30 s window), `queue_position` while queued, model, timings and metrics, or the error if it failed |
 | `GET` | `/jobs/{id}/transcript?format=` | The transcript. `409` until it's ready, `422` if the job failed |
 | `DELETE` | `/jobs/{id}` | Forget a job (and its upload if it's still queued) |
 | `GET` | `/languages` | Languages the loaded model supports, and the default |

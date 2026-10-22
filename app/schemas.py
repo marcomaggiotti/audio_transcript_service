@@ -54,6 +54,9 @@ class Job(BaseModel):
     size_bytes: int
     language: str | None = Field(None, description="Requested language; None = auto-detect")
     status: JobStatus = JobStatus.queued
+    stage: str | None = Field(None, description="While processing: decoding, then transcribing")
+    progress: float = Field(0.0, ge=0, le=1, description="Share of the audio transcribed so far (0-1)")
+    queue_position: int | None = Field(None, description="Jobs ahead of this one while it is queued (0 = next)")
     error: str | None = None
     model: str | None = None
     created_at: datetime = Field(default_factory=utcnow)

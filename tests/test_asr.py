@@ -133,3 +133,11 @@ def test_confidence_and_no_speech_are_recorded():
     assert seg.no_speech_prob == pytest.approx(np.exp(2.0) / np.exp(sot).sum(), abs=1e-4)
     # Each text token had logit 10 against ~1500 zeros (fewer after the timestamp rules).
     assert -0.2 < seg.avg_logprob < 0
+
+
+def test_progress_after_each_window():
+    first = [ts(0), 0, ts(29.0), EOT]  # a single closing timestamp: the whole 30 s window is consumed
+    second = [ts(1.0), 4, ts(3.0), EOT]
+    seen = []
+    make([first, second]).transcribe(np.zeros(16000 * 40, dtype=np.float32), "en", on_progress=seen.append)
+    assert seen[0] == pytest.approx(30 / 40) and seen[-1] == 1.0

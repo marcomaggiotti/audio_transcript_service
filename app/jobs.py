@@ -90,9 +90,19 @@ class TranscriptionService:
 
     def get(self, job_id: str) -> Job:
         try:
-            return self.jobs[job_id]
+            job = self.jobs[job_id]
         except KeyError:
             raise JobNotFound(job_id) from None
+        if job.status == JobStatus.queued:  # jobs are kept in submission order
+            ahead = 0
+            for other in self.jobs.values():
+                if other.id == job_id:
+                    break
+                ahead += other.status == JobStatus.queued
+            job.queue_position = ahead
+        else:
+            job.queue_position = None
+        return job
 
     def list(self) -> list[Job]:
         return list(reversed(self.jobs.values()))
@@ -144,7 +154,7 @@ class TranscriptionService:
         job = self.jobs.get(job_id)
         if job is None:
             return  # deleted while queued
-        job.status, job.started_at = JobStatus.processing, utcnow()
+        job.status, job.started_at, job.stage = JobStatus.processing, utcnow(), "decoding"
         path = self.upload_path(job_id)
         try:
             if self.transcriber is None:
@@ -157,12 +167,17 @@ class TranscriptionService:
             if seconds > self.max_audio_seconds:
                 raise InvalidAudioError(f"Audio is longer than the {self.max_audio_seconds}s limit")
             t1 = time.perf_counter()
-            result = self.transcriber.transcribe(audio, language=job.language)
+            job.stage = "transcribing"
+
+            def progress(share: float) -> None:
+                job.progress = round(share, 3)
+
+            result = self.transcriber.transcribe(audio, language=job.language, on_progress=progress)
             t2 = time.perf_counter()
         except Exception as e:
             logger.exception("Transcription failed for %s", job_id)
             job.error = str(e) or e.__class__.__name__
-            job.status, job.finished_at = JobStatus.failed, utcnow()
+            job.status, job.finished_at, job.stage = JobStatus.failed, utcnow(), None
             path.unlink(missing_ok=True)
             return
 
@@ -184,5 +199,6 @@ class TranscriptionService:
             peak_memory_mb=peak_memory_mb(),
         )
         # Status last, so a reader that sees "completed" also sees the transcript.
+        job.progress, job.stage = 1.0, None
         job.status, job.finished_at = JobStatus.completed, utcnow()
         logger.info("Transcribed %s: %.1fs audio in %.2fs", job_id, seconds, t2 - t1)
