@@ -19,6 +19,7 @@ to the last complete timestamp, the same "seek" strategy openai/whisper uses.
 import json
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -62,7 +63,8 @@ class TranscriptionResult:
 class Transcriber(Protocol):
     name: str
 
-    def transcribe(self, audio: np.ndarray, language: str | None = None) -> TranscriptionResult: ...
+    def transcribe(self, audio: np.ndarray, language: str | None = None,
+                   on_progress: Callable[[float], None] | None = None) -> TranscriptionResult: ...
 
 
 class ModelLoadError(RuntimeError):
@@ -190,7 +192,9 @@ class OnnxWhisperTranscriber:
 
     # ------------------------------------------------------------------ public
 
-    def transcribe(self, audio: np.ndarray, language: str | None = None) -> TranscriptionResult:
+    def transcribe(self, audio: np.ndarray, language: str | None = None,
+                   on_progress: Callable[[float], None] | None = None) -> TranscriptionResult:
+        """`on_progress` gets the share of the audio transcribed (0-1) after each 30 s window."""
         duration = audio.shape[0] / SAMPLE_RATE
         segments: list[Segment] = []
         detected: str | None = None
@@ -225,6 +229,8 @@ class OnnxWhisperTranscriber:
                     segments.append(Segment(round(start, 2), round(end, 2), seg.text,
                                             seg.avg_logprob, no_speech))
             seek += max(int(consumed * SAMPLE_RATE), SAMPLE_RATE)  # always move forward
+            if on_progress:
+                on_progress(min(1.0, seek / audio.shape[0]))
 
         return TranscriptionResult(language=detected or language, segments=segments)
 

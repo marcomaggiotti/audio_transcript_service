@@ -28,9 +28,11 @@ class FakeTranscriber:
         self.languages = []
         self.gate: threading.Event | None = None  # set by a test to hold transcriptions until released
 
-    def transcribe(self, audio, language=None):
+    def transcribe(self, audio, language=None, on_progress=None):
         self.calls += 1
         self.languages.append(language)
+        if on_progress:
+            on_progress(0.5)  # as if half the windows were done
         if self.gate is not None:
             self.gate.wait(10)
         if self.error:

@@ -179,3 +179,22 @@ def test_api_token(settings, transcriber):
         assert upload(client, "/transcribe", headers={"Authorization": "bearer secret"}).status_code == 200
         assert client.get("/health").status_code == 200
         assert client.get("/healthz").status_code == 200
+
+
+def test_progress_and_queue_position(client, transcriber):
+    transcriber.gate = threading.Event()
+    first, second = upload(client).json(), upload(client).json()
+    try:
+        for _ in range(100):
+            running = client.get(first["status_url"]).json()
+            if running["stage"] == "transcribing":
+                break
+            time.sleep(0.02)
+        assert running["status"] == "processing" and running["progress"] == 0.5
+        waiting = client.get(second["status_url"]).json()
+        assert waiting["status"] == "queued" and waiting["queue_position"] == 0 and waiting["progress"] == 0
+    finally:
+        transcriber.gate.set()
+    done = wait_for(client, first["id"])
+    assert done["progress"] == 1.0 and done["stage"] is None and done["queue_position"] is None
+    assert wait_for(client, second["id"])["status"] == "completed"
