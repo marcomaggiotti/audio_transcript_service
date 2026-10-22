@@ -1,0 +1,8 @@
+# Direct dependencies pinned to the versions the test suite ran against.
+fastapi==0.146.0
+uvicorn[standard]==0.53.0
+python-multipart==0.0.32
+pydantic==2.13.5
+numpy==2.5.3
+onnxruntime==1.29.0
+tokenizers==0.23.3

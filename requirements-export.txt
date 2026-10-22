@@ -1,0 +1,9 @@
+# Only for scripts/export_whisper_onnx.py (build time). Install CPU torch first:
+#   pip install --index-url https://download.pytorch.org/whl/cpu torch
+# optimum 2.x moved the ONNX exporter (`optimum-cli export onnx`) into optimum-onnx,
+# which pins optimum ~=2.1 and transformers <4.58; its [onnxruntime] extra is needed to
+# validate and fix dynamic shapes during export.
+optimum-onnx[onnxruntime]==0.1.0
+transformers>=4.44,<4.58
+# Lets the exporter deduplicate tied weights (whisper-tiny decoder: 198 MB -> 118 MB).
+accelerate>=1.0
