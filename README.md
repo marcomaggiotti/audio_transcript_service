@@ -21,7 +21,7 @@ This service keeps only that part. It has no search or embeddings.
 
 | Area | Implementation |
 |---|---|
-| Speech recognition | Whisper exported to ONNX (INT8, KV-cache decoder). Whisper's timestamp rules, 30 s windows with seek, language auto-detect, temperature fallback, previous-text and initial prompts (`app/asr.py`) |
+| Speech recognition | Whisper exported to ONNX (fp32 encoder, INT8 KV-cache decoder: an INT8 encoder garbles real speech, see `scripts/export_whisper_onnx.py`). Whisper's timestamp rules, 30 s windows with seek, language auto-detect, temperature fallback, previous-text and initial prompts (`app/asr.py`) |
 | Features | Whisper log-mel spectrogram in pure NumPy, no torch or librosa at runtime (`app/features.py`) |
 | Audio | Magic-byte format check, ffmpeg decoding to 16 kHz mono with a pure-Python WAV fallback (`app/audio.py`) |
 | Jobs | In-process asyncio queue with bounded concurrency. Synchronous requests use the same queue (`app/jobs.py`) |

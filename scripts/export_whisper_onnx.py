@@ -13,9 +13,14 @@ Pipeline (each step keeps the graphs runnable on the runtime's onnxruntime):
      dequantize). The embedding Gather is rewritten to read the transposed table, so one table serves both.
   3. Fuse the encoder's self-attention into com.microsoft.MultiHeadAttention (no [heads, 1500, 1500]
      score tensor; ~-40 MB peak per window).
-  4. INT8 dynamic quantization (weights int8 per channel, activations quantized on the fly).
+  4. INT8 dynamic quantization of the decoder (weights int8 per channel, activations quantized on the fly).
+     The encoder stays fp32: quantizing it garbles real speech. Measured with the real whisper-tiny weights
+     (20 TTS sentences + a recorded voice note): fp32 5.0% WER; decoder int8 5.7% (+27 MB RAM over all-int8);
+     encoder int8 7.1%, and the voice note "Take a bottle of milk and kilogram of flour." became
+     "Thank you. A little bit of milk and I'll take you to the flower.".
   5. Merge decoder + decoder_with_past into decoder_model_merged.onnx (shared weights, If node).
-  --fp32 skips step 4 (2.5x the RAM, same KV-cache speed).
+  --quantize all also quantizes the encoder (smallest, worse transcripts); --quantize none (or --fp32) skips
+  step 4 (about +90 MB of RAM for tiny, a little more accurate).
 """
 
 import argparse
@@ -169,7 +174,10 @@ def main() -> int:
     parser.add_argument("--model", default="openai/whisper-tiny",
                         help="Hugging Face model id, e.g. openai/whisper-base or openai/whisper-tiny.en")
     parser.add_argument("--output", default="models/whisper-tiny")
-    parser.add_argument("--fp32", action="store_true", help="Skip INT8 quantization")
+    parser.add_argument("--quantize", choices=["decoder", "all", "none"], default="decoder",
+                        help="INT8 weights for: the decoder only (default), encoder and decoder (smaller, but "
+                             "garbles real speech), or nothing")
+    parser.add_argument("--fp32", action="store_true", help="Same as --quantize none")
     parser.add_argument("--prune", action="store_true",
                         help="Delete exported graphs the service does not load (smaller Docker image)")
     args = parser.parse_args()
@@ -197,9 +205,12 @@ def main() -> int:
         untie_lm_head(output / name)
     fused = fuse_encoder_attention(output / "encoder_model.onnx", config["encoder_attention_heads"])
     print(f"fused {fused}/{config['encoder_layers']} encoder attention blocks")
-    if not args.fp32:
-        for name in ("encoder_model.onnx", "decoder_model.onnx", "decoder_with_past_model.onnx"):
-            quantize(output / name)
+    quantized = {"decoder": ("decoder_model.onnx", "decoder_with_past_model.onnx"),
+                 "all": ("encoder_model.onnx", "decoder_model.onnx", "decoder_with_past_model.onnx"),
+                 "none": ()}["none" if args.fp32 else args.quantize]
+    for name in quantized:
+        quantize(output / name)
+    print(f"INT8: {', '.join(quantized) or 'nothing'}")
     merge_decoders(output / "decoder_model.onnx", output / "decoder_with_past_model.onnx",
                    save_path=output / "decoder_model_merged.onnx", strict=False)
     smoke_test(output)
