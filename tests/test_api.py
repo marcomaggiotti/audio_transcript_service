@@ -213,3 +213,10 @@ def test_config_needs_the_token(settings, transcriber):
     with TestClient(create_app(settings, Components(transcriber=transcriber))) as c:
         assert c.get("/config").status_code == 401
         assert c.get("/config", headers={"X-API-Key": "secret"}).status_code == 200
+
+
+def test_precision_must_be_in_the_export(client):
+    # The fake model reports no variants: only the default can be used.
+    res = upload(client, data={"encoder": "int8"})
+    assert res.status_code == 422 and "encoder precision int8 isn't available" in res.json()["detail"]
+    assert upload(client, data={"decoder": "fp16"}).status_code == 422  # not a precision at all
