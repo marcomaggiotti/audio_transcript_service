@@ -208,3 +208,10 @@ def test_initial_prompt_on_every_window():
     t.transcribe(np.zeros(16000 * 40, dtype=np.float32), "en",
                  options=DecodingOptions(initial_prompt="onnx runtime", condition_on_previous_text=True))
     assert t.decoder.prompts == [[PREV, 2, 3, SOT, EN, TRANSCRIBE], [PREV, 2, 3, 2, SOT, EN, TRANSCRIBE]]
+
+
+def test_onnx_precision_reads_the_graph_ops(tmp_path):
+    from app.asr import onnx_precision
+    (tmp_path / "q.onnx").write_bytes(b"\x08\x07...DynamicQuantizeLinear...MatMulInteger...")
+    (tmp_path / "f.onnx").write_bytes(b"\x08\x07...MatMul...Softmax...")
+    assert onnx_precision(tmp_path / "q.onnx") == "int8" and onnx_precision(tmp_path / "f.onnx") == "fp32"

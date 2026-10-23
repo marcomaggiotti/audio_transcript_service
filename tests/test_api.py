@@ -198,3 +198,18 @@ def test_progress_and_queue_position(client, transcriber):
     done = wait_for(client, first["id"])
     assert done["progress"] == 1.0 and done["stage"] is None and done["queue_position"] is None
     assert wait_for(client, second["id"])["status"] == "completed"
+
+
+def test_config_reports_the_pipeline(client):
+    body = client.get("/config").json()
+    assert body["audio"]["sample_rate"] == 16000 and body["windows"]["samples"] == 480000
+    assert body["features"]["frame_ms"] == 25 and body["features"]["hop_ms"] == 10
+    assert body["features"]["shape"] == [80, 3000] and body["model"]["name"] == "fake-whisper"
+    assert body["decoding"]["temperatures"][0] == 0.0
+
+
+def test_config_needs_the_token(settings, transcriber):
+    settings.api_token = "secret"
+    with TestClient(create_app(settings, Components(transcriber=transcriber))) as c:
+        assert c.get("/config").status_code == 401
+        assert c.get("/config", headers={"X-API-Key": "secret"}).status_code == 200

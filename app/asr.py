@@ -105,6 +105,17 @@ class ModelLoadError(RuntimeError):
     pass
 
 
+def onnx_precision(path: Path) -> str:
+    """'int8' if the graph was dynamically quantized (scripts/export_whisper_onnx.py), else 'fp32'.
+
+    Op types are stored as plain strings in the protobuf, so this needs no onnx package and no full parse.
+    """
+    import mmap
+
+    with path.open("rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+        return "int8" if data.find(b"DynamicQuantizeLinear") >= 0 or data.find(b"MatMulInteger") >= 0 else "fp32"
+
+
 @dataclass
 class WhisperTokens:
     """Special token ids, resolved from the tokenizer and generation config."""
@@ -224,7 +235,10 @@ class OnnxWhisperTranscriber:
         n_mels = _load_json(path / "preprocessor_config.json").get("feature_size", 80)
         model_id = path / "model_id.txt"  # written by scripts/export_whisper_onnx.py
         name = model_id.read_text().strip() if model_id.exists() else os.path.basename(path.resolve())
-        return cls(encoder, decoder, tokenizer, tokens, n_mels=n_mels, max_new_tokens=max_new_tokens, name=name)
+        transcriber = cls(encoder, decoder, tokenizer, tokens, n_mels=n_mels, max_new_tokens=max_new_tokens, name=name)
+        transcriber.precision = {"encoder": onnx_precision(path / "encoder_model.onnx"),
+                                 "decoder": onnx_precision(path / decoder_file)}
+        return transcriber
 
     # ------------------------------------------------------------------ public
 

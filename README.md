@@ -40,6 +40,7 @@ This service keeps only that part. It has no search or embeddings.
 | `GET` | `/jobs/{id}` | Status, `stage` (decoding, transcribing), `progress` (0–1, updated after each 30 s window), `queue_position` while queued, model, timings and metrics, or the error if it failed |
 | `GET` | `/jobs/{id}/transcript?format=` | The transcript. `409` until it's ready, `422` if the job failed |
 | `DELETE` | `/jobs/{id}` | Forget a job (and its upload if it's still queued) |
+| `GET` | `/config` | How audio becomes text here: decoding, windows, log-mel features (fixed by Whisper) and the model, its encoder/decoder precision (read from the ONNX graphs) and decoding defaults |
 | `GET` | `/languages` | Languages the loaded model supports, and the default |
 | `GET` | `/health` | Model status, queue depth, active jobs |
 | `GET` | `/healthz` | Liveness: `503` if the speech model didn't load |
