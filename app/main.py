@@ -26,6 +26,7 @@ from app.benchmark import (
 from app.config import Settings, get_settings
 from app.formats import RENDERERS
 from app.jobs import JobNotFound, QueueFullError, TranscriptionService
+from app.models import ModelSet, ModelUnavailable, memory_limit_mb
 from app.schemas import (
     BenchmarkCreate,
     BenchmarkModel,
@@ -71,8 +72,10 @@ class Components:
     """Injectable dependencies; tests pass fakes, production builds them from Settings."""
 
     transcriber: Transcriber | None = None
-    # Loads another model for the benchmark (tests pass a fake); default: OnnxWhisperTranscriber.from_dir.
+    # Loads another model for a job or the benchmark (tests pass a fake); default: OnnxWhisperTranscriber.from_dir.
     load_model: Callable[[Path], Transcriber] | None = None
+    # The container's memory in MB, for the "does this model fit" check (tests set it); default: from cgroups.
+    memory_limit_mb: float | None = None
 
 
 def _clock(seconds: float) -> str:
@@ -98,19 +101,25 @@ def create_app(settings: Settings | None = None, components: Components | None =
                 transcriber_error = str(e)
                 logger.error("Speech model not loaded: %s", e)
 
+        def load_model(path: Path) -> Transcriber:
+            return OnnxWhisperTranscriber.from_dir(str(path), settings.max_new_tokens, settings.onnx_threads,
+                                                   low_memory=settings.whisper_low_memory)
+
+        # Models a job can choose: the service's own, and every other export in MODELS_DIR (EXTRA_MODELS).
+        models = ModelSet(transcriber, settings.whisper_model_dir, settings.models_dir,
+                          components.load_model or load_model,
+                          limit_mb=components.memory_limit_mb if components.memory_limit_mb is not None
+                          else memory_limit_mb())
         service = TranscriptionService(
             transcriber, settings.upload_dir, transcriber_error,
             max_audio_seconds=settings.max_audio_seconds,
             concurrency=settings.worker_concurrency,
             max_queue_size=settings.max_queue_size,
             max_finished_jobs=settings.max_finished_jobs,
+            models=models,
         )
         app.state.service = service
         await service.start()
-
-        def load_model(path: Path) -> Transcriber:
-            return OnnxWhisperTranscriber.from_dir(str(path), settings.max_new_tokens, settings.onnx_threads,
-                                                   low_memory=settings.whisper_low_memory)
 
         store = BenchmarkStore(settings.benchmark_dir)
         store.setup()
@@ -154,20 +163,30 @@ def create_app(settings: Settings | None = None, components: Components | None =
         except JobNotFound:
             raise HTTPException(404, f"Job {job_id} not found")
 
-    def check_precision(service: TranscriptionService, encoder: str | None, decoder: str | None) -> None:
-        available = getattr(service.transcriber, "available_precisions", None) or {}
-        default = getattr(service.transcriber, "precision", None) or {}
+    def check_model(service: TranscriptionService, model: str | None, language: str,
+                    encoder: str | None, decoder: str | None) -> None:
+        """The requested model exists, fits in memory and has the language and the precisions asked for."""
+        try:
+            info = service.models.check(model, None if language == "auto" else language)
+        except ModelUnavailable as e:
+            raise HTTPException(422, str(e))
+        if info.default:  # the loaded model knows its own precisions (test fakes have none)
+            available = getattr(service.transcriber, "available_precisions", None) or {}
+            default = getattr(service.transcriber, "precision", None) or {}
+        else:
+            available, default = info.available_precisions, info.precision
         for part, p in (("encoder", encoder), ("decoder", decoder)):
             if p and p != default.get(part) and p not in available.get(part, []):
                 have = ", ".join(available.get(part) or [default.get(part) or "the default only"])
-                raise HTTPException(422, f"{part} precision {p} isn't available in this export ({have}); see GET /config")
+                raise HTTPException(422, f"{part} precision {p} isn't available for {info.id} ({have}); see GET /config")
 
-    def check_ready(service: TranscriptionService, language: str | None) -> str:
+    def check_ready(service: TranscriptionService, language: str | None, model: str | None = None) -> str:
         """Fail early when nothing could be transcribed; return the language to use."""
         if service.transcriber is None:
             raise HTTPException(503, f"Speech model unavailable: {service.transcriber_error or 'not loaded'}")
         language = language or settings.default_language
-        if language != "auto" and service.languages and language not in service.languages:
+        # Another model's languages are checked with it (check_model): an English-only one has fewer.
+        if not model and language != "auto" and service.languages and language not in service.languages:
             raise HTTPException(422, f"Unsupported language '{language}'; see GET /languages")
         return language
 
@@ -196,7 +215,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
     def submit_job(service: TranscriptionService, job_id: str, filename: str, size: int, language: str,
                    temperature_fallback: bool | None = None, condition_on_previous_text: bool | None = None,
                    initial_prompt: str | None = None, encoder: str | None = None,
-                   decoder: str | None = None) -> Job:
+                   decoder: str | None = None, model: str | None = None) -> Job:
         """Queue the audio at service.upload_path(job_id), with the default decoding options unless given."""
         job = Job(
             id=job_id, filename=filename, size_bytes=size, language=None if language == "auto" else language,
@@ -206,6 +225,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
                                         else condition_on_previous_text),
             initial_prompt=(initial_prompt or settings.initial_prompt or "").strip() or None,
             encoder_precision=encoder, decoder_precision=decoder,
+            requested_model=service.models.find(model).id if model else None,
         )
         try:
             service.submit(job)
@@ -216,8 +236,8 @@ def create_app(settings: Settings | None = None, components: Components | None =
     async def accept_upload(service: TranscriptionService, file: UploadFile, language: str | None,
                             **options) -> Job:
         """Validate and store the upload, then queue it as a job."""
-        language = check_ready(service, language)
-        check_precision(service, options.get("encoder"), options.get("decoder"))
+        language = check_ready(service, language, options.get("model"))
+        check_model(service, options.get("model"), language, options.get("encoder"), options.get("decoder"))
         job_id = uuid.uuid4().hex
         size = await save_upload(file, service.upload_path(job_id))
         return submit_job(service, job_id, file.filename or "audio", size, language, **options)
@@ -249,6 +269,9 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          description="Encoder precision: fp32 (full, the default) or int8 (smaller, less accurate)")
     decoder_param = Form(None, pattern=r"^(fp32|int8)$",
                          description="Decoder precision: int8 (the default) or fp32 (full)")
+    model_param = Form(None, max_length=200,
+                       description="Model for this job, e.g. openai/whisper-small (see GET /config); default: the "
+                                   "service's. Another model is loaded for the job and released after it")
 
     # ------------------------------------------------------------ synchronous
 
@@ -258,12 +281,12 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          format: OutputFormat = format_param, temperature_fallback: bool | None = fallback_param,
                          condition_on_previous_text: bool | None = previous_param,
                          initial_prompt: str | None = prompt_param, encoder: str | None = encoder_param,
-                         decoder: str | None = decoder_param):
+                         decoder: str | None = decoder_param, model: str | None = model_param):
         """Upload audio and wait for its transcript. Shares the job queue, so it waits its turn."""
         service = service_of(request)
         job = await accept_upload(service, file, language, temperature_fallback=temperature_fallback,
                                   condition_on_previous_text=condition_on_previous_text,
-                                  initial_prompt=initial_prompt, encoder=encoder, decoder=decoder)
+                                  initial_prompt=initial_prompt, encoder=encoder, decoder=decoder, model=model)
         try:
             job = await service.wait(job.id)
         finally:
@@ -280,14 +303,14 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          temperature_fallback: bool | None = fallback_param,
                          condition_on_previous_text: bool | None = previous_param,
                          initial_prompt: str | None = prompt_param, encoder: str | None = encoder_param,
-                         decoder: str | None = decoder_param):
+                         decoder: str | None = decoder_param, model: str | None = model_param):
         """Upload audio for background transcription; poll the status URL, then fetch the transcript.
 
-        `encoder` / `decoder` pick the precision of each part for this job (see GET /config for what the
-        export has); a non-default part is loaded for the job and released after it."""
+        `model` picks the speech model and `encoder` / `decoder` the precision of each part for this job (see
+        GET /config for what this deployment has); anything not loaded is loaded for the job and released after."""
         job = await accept_upload(service_of(request), file, language, temperature_fallback=temperature_fallback,
                                   condition_on_previous_text=condition_on_previous_text,
-                                  initial_prompt=initial_prompt, encoder=encoder, decoder=decoder)
+                                  initial_prompt=initial_prompt, encoder=encoder, decoder=decoder, model=model)
         return summary(job)
 
     @app.get("/jobs", response_model=list[JobSummary])
@@ -526,6 +549,8 @@ def create_app(settings: Settings | None = None, components: Components | None =
                       "available_precisions": getattr(t, "available_precisions", None) or {},
                       "low_memory": settings.whisper_low_memory,
                       "onnx_threads": settings.onnx_threads, "runtime": "ONNX Runtime (CPU)"},
+            "models": [m.view(*service.models.fits(m)) for m in service.models.list()],
+            "memory_limit_mb": round(service.models.limit_mb) if service.models.limit_mb else None,
             "audio": {"decoder": "ffmpeg (pure-Python fallback for WAV)", "sample_rate": features.SAMPLE_RATE,
                       "channels": 1, "sample_format": "16-bit PCM", "max_audio_seconds": settings.max_audio_seconds,
                       "max_upload_mb": settings.max_upload_mb},

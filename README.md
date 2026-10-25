@@ -181,6 +181,25 @@ never in memory together. Measured on whisper-tiny, one thread, low-memory mode,
 `GET /config` lists what the export has (`model.available_precisions`). `--no-variants` on the export keeps
 only the default pair (about 120 MB smaller image; jobs can't choose).
 
+### Model per job
+
+Besides its own model (`WHISPER_MODEL`, loaded at start), the image can hold more (`EXTRA_MODELS`, e.g.
+`openai/whisper-small`, exported with only the recommended precision pair). `POST /jobs` and `POST /transcribe`
+take `model=openai/whisper-small` (or `whisper-small`); the job records the model used (`model`). Another model
+is loaded for the job and released after it, like a non-default precision, so at most one extra model is in
+memory; its load time is reported apart (`metrics.load_seconds`).
+
+Before queuing, the service checks the model exists, can transcribe the language (an `.en` model only does
+English), has the precisions asked for, and fits in the container's memory: its files × 1.3 + 150 MB, next
+to what the process already holds, within 90% of the cgroup limit (`MEMORY_LIMIT_MB` overrides it). A model
+that doesn't fit is refused with `422` and the reason, instead of the process being killed. `GET /config`
+lists the models (`models`: precisions, languages, `needs_mb`, `fits`, `reason`) and `memory_limit_mb`.
+
+| Model | Size | Italian | Memory while transcribing | Render plan |
+|---|---|---|---|---|
+| whisper-tiny | 39 M parameters | usable on clear speech | ~300 MB | starter (512 MB) |
+| whisper-small | 244 M parameters | much better | ~1 GB, next to tiny | standard (2 GB) |
+
 ## Run locally
 
 ```bash
@@ -218,7 +237,9 @@ pytest
 | `WHISPER_LOW_MEMORY` | `false` | About 25 MB less RAM, about 1.5x slower transcription |
 | `TEMPERATURE_FALLBACK` / `CONDITION_ON_PREVIOUS_TEXT` | `true` / `true` | Decoding defaults; requests can override them |
 | `INITIAL_PROMPT` | – | Default initial prompt (names, terms) |
-| `MODELS_DIR` | `./models` | Exports the benchmark can compare |
+| `MODELS_DIR` | `./models` | Exports jobs can choose (`model=`) and the benchmark can compare |
+| `EXTRA_MODELS` | – | Build arg: more models exported into the image for jobs, e.g. `openai/whisper-small` |
+| `MEMORY_LIMIT_MB` | the cgroup limit | Memory the "does this model fit" check plans with |
 | `BENCHMARK_DIR` | `./data/benchmark` | Recordings, reference clips and runs |
 | `MAX_CLIP_SECONDS` | `300` | Longest reference clip |
 | `API_TOKEN` | – | Requires a token for the transcription endpoints |
