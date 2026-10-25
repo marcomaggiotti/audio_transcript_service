@@ -2,6 +2,9 @@
 # On Render, the WHISPER_MODEL environment variable is passed in as this build arg.
 FROM python:3.12-slim AS export
 ARG WHISPER_MODEL=openai/whisper-tiny
+# More models a job can choose (POST /jobs model=...), space-separated, e.g. "openai/whisper-small". Only their
+# recommended precision pair is exported (encoder fp32, decoder int8), to keep the image smaller.
+ARG EXTRA_MODELS=""
 # More models for the Benchmark tab to compare, space-separated (e.g. "openai/whisper-base").
 ARG BENCHMARK_MODELS=""
 WORKDIR /build
@@ -13,6 +16,9 @@ RUN pip install --no-cache-dir "setuptools>=77.0.3" \
  && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.14.1 \
  && pip install --no-cache-dir -r requirements-export.txt
 RUN python export_whisper_onnx.py --model "$WHISPER_MODEL" --output /models/whisper --prune \
+ && for model in $EXTRA_MODELS; do \
+      python export_whisper_onnx.py --model "$model" --output "/models/$(basename "$model")" --prune --no-variants; \
+    done \
  && for model in $BENCHMARK_MODELS; do \
       python export_whisper_onnx.py --model "$model" --output "/models/$(basename "$model")" --prune; \
     done

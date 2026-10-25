@@ -17,6 +17,7 @@ from pathlib import Path
 from app.asr import DecodingOptions, Transcriber
 from app.audio import InvalidAudioError, decode_audio, duration_seconds
 from app.metrics import peak_memory_mb
+from app.models import ModelSet
 from app.schemas import InferenceMetrics, Job, JobStatus, Transcript, TranscriptSegment, utcnow
 
 logger = logging.getLogger(__name__)
@@ -33,8 +34,10 @@ class JobNotFound(KeyError):
 class TranscriptionService:
     def __init__(self, transcriber: Transcriber | None, upload_dir: str, transcriber_error: str | None = None,
                  max_audio_seconds: int = 1800, concurrency: int = 1, max_queue_size: int = 20,
-                 max_finished_jobs: int = 200):
+                 max_finished_jobs: int = 200, models: ModelSet | None = None):
         self.transcriber = transcriber
+        # The models a job can choose; by default only the service's own.
+        self.models = models or ModelSet(transcriber, None, None, None)
         self.transcriber_error = transcriber_error
         self.upload_dir = Path(upload_dir)
         self.max_audio_seconds = max_audio_seconds
@@ -181,8 +184,24 @@ class TranscriptionService:
             options = DecodingOptions(temperature_fallback=job.temperature_fallback,
                                       condition_on_previous_text=job.condition_on_previous_text,
                                       initial_prompt=job.initial_prompt)
-            result = self.transcriber.transcribe(audio, language=job.language, on_progress=progress,
-                                                 options=options)
+            def loading(model_id: str) -> None:
+                job.stage = f"loading {model_id}"
+
+            # The service's model, or the one the job asked for, loaded for it and released after it.
+            with self.models.use(job.requested_model, on_load=loading) as transcriber:
+                job.stage = "transcribing"
+                t_load = time.perf_counter()  # inference is timed from here: loading isn't inference
+                job.model = transcriber.name
+                switch = getattr(transcriber, "precision_for", None)  # absent on test fakes
+                if switch is None:
+                    job.precision = getattr(transcriber, "precision", None)
+                    result = transcriber.transcribe(audio, language=job.language, on_progress=progress,
+                                                    options=options)
+                else:
+                    with switch(job.encoder_precision, job.decoder_precision) as used:
+                        job.precision = used
+                        result = transcriber.transcribe(audio, language=job.language, on_progress=progress,
+                                                        options=options)
             t2 = time.perf_counter()
         except Exception as e:
             logger.exception("Transcription failed for %s", job_id)
@@ -191,7 +210,6 @@ class TranscriptionService:
             path.unlink(missing_ok=True)
             return
 
-        job.model = self.transcriber.name
         job.transcript = Transcript(
             language=result.language or job.language,
             duration_seconds=round(seconds, 2),
@@ -204,11 +222,12 @@ class TranscriptionService:
         job.metrics = InferenceMetrics(
             audio_seconds=round(seconds, 2),
             decode_seconds=round(t1 - t0, 3),
-            inference_seconds=round(t2 - t1, 3),
-            real_time_factor=round((t2 - t1) / seconds, 3) if seconds else 0.0,
+            inference_seconds=round(t2 - t_load, 3),
+            real_time_factor=round((t2 - t_load) / seconds, 3) if seconds else 0.0,
+            load_seconds=round(t_load - t1, 3) if t_load - t1 >= 0.01 else None,
             peak_memory_mb=peak_memory_mb(),
         )
         # Status last, so a reader that sees "completed" also sees the transcript.
         job.progress, job.stage = 1.0, None
         job.status, job.finished_at = JobStatus.completed, utcnow()
-        logger.info("Transcribed %s: %.1fs audio in %.2fs", job_id, seconds, t2 - t1)
+        logger.info("Transcribed %s with %s: %.1fs audio in %.2fs", job_id, job.model, seconds, t2 - t_load)
