@@ -220,10 +220,6 @@ transcription requests get `503`.
 Any Whisper checkpoint on Hugging Face works: `openai/whisper-base`, `openai/whisper-small`, or an
 English-only `openai/whisper-tiny.en`. Larger models are more accurate but slower and use more RAM.
 
-The Render deployment uses `openai/whisper-tiny.en` (`render.yaml`): better than `whisper-tiny` on English at the
-same size and speed. It only transcribes English, so `whisper-tiny` is in `EXTRA_MODELS` for every other
-language: a client asks for it per job (Aipollo does this by itself for recordings not set to English).
-
 Tests use a fake Whisper, so they need no model download:
 
 ```bash

@@ -42,17 +42,13 @@ services:
         - "**/*.md"
     envVars:
       # --- Speech model (also passed to the Docker build as a build arg) ---
-      # English-only whisper-tiny.en: more accurate than whisper-tiny on English, same size and speed, but it
-      # can't transcribe other languages (a job asking for one gets 422). Aipollo sends recordings that aren't
-      # known to be English to the multilingual whisper-tiny below instead.
       - key: WHISPER_MODEL
-        value: openai/whisper-tiny.en
+        value: openai/whisper-tiny
       # More models a job can choose (podcast-search: "Transcribe again" → Model), exported into the image,
-      # space-separated. whisper-tiny: every other language (Italian...). whisper-small is much better than
-      # tiny for Italian but needs ~1 GB while it transcribes: on starter (512 MB) the service refuses it with
-      # that reason; it works on standard (2 GB).
+      # space-separated. whisper-small is much better than tiny for Italian but needs ~1 GB while it
+      # transcribes: on starter (512 MB) the service refuses it with that reason; it works on standard (2 GB).
       - key: EXTRA_MODELS
-        value: openai/whisper-tiny openai/whisper-small
+        value: openai/whisper-small
       # More models for the Benchmark tab, exported into the image (space-separated), e.g.
       # "openai/whisper-base". A run keeps the service's model loaded and loads one more: on starter
       # (512 MB) compare at most tiny models; use standard (2 GB) for base or small.
