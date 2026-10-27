@@ -98,6 +98,10 @@ def test_long_audio_is_split_into_windows_with_offsets():
     second = [ts(1.0), 4, ts(3.0), EOT]
     result = make([first, second]).transcribe(np.zeros(16000 * 40, dtype=np.float32), language="en")
     assert [(s.start, s.end, s.text) for s in result.segments] == [(0.0, 29.0, "hello"), (31.0, 33.0, "bye")]
+    # The trace: one closing timestamp consumes the whole window, so the second starts at 30 s with the last 10 s.
+    assert [(w.start, w.length, w.consumed, w.segments, w.skipped) for w in result.windows] == [
+        (0.0, 30.0, 30.0, 1, False), (30.0, 10.0, 10.0, 1, False)]
+    assert [a["temperature"] for a in result.windows[0].attempts] == [0.0]
 
 
 def test_end_times_are_clamped_to_audio_duration():
@@ -174,6 +178,8 @@ def test_temperature_fallback_redecodes_a_repetition_loop():
     fixed = t.transcribe(audio, "en", options=DecodingOptions(temperature_fallback=True))
     assert [s.text for s in fixed.segments] == ["onnx runtime"]
     assert t.decoder.attempts == {0: 1}  # second attempt (temperature 0.2) was good enough
+    [window] = fixed.windows
+    assert [a["temperature"] for a in window.attempts] == [0.0, 0.2] and window.attempts[0]["compression_ratio"] > 2.4
 
 
 def test_fallback_skips_silent_unsure_windows():
@@ -183,8 +189,10 @@ def test_fallback_skips_silent_unsure_windows():
     # Weak logits make every token unsure (avg log-prob well below -1); no-speech dominates the first step.
     t = make([[ts(0), 0, ts(1.0), EOT]], language_scores={NOSPEECH: 10.0}, strength=4.0)
     t.tokens.no_speech = NOSPEECH
-    assert t.transcribe(audio, "en", options=options).segments == []
+    silent = t.transcribe(audio, "en", options=options)
+    assert silent.segments == []
     assert t.decoder.attempts == {0: 0}  # silence: no retries
+    assert silent.windows[0].skipped and silent.windows[0].no_speech_prob > 0.6 and silent.windows[0].segments == 0
     t = make([[ts(0), 0, ts(1.0), EOT]], language_scores={NOSPEECH: 10.0}, strength=4.0)
     t.tokens.no_speech = NOSPEECH
     assert [s.text for s in t.transcribe(audio, "en").segments] == ["hello"]  # greedy keeps it

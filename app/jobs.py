@@ -18,7 +18,7 @@ from app.asr import DecodingOptions, Transcriber
 from app.audio import InvalidAudioError, decode_audio, duration_seconds
 from app.metrics import peak_memory_mb
 from app.models import ModelSet
-from app.schemas import InferenceMetrics, Job, JobStatus, Transcript, TranscriptSegment, utcnow
+from app.schemas import InferenceMetrics, Job, JobStatus, Transcript, TranscriptSegment, WindowTrace, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +218,9 @@ class TranscriptionService:
                                         avg_logprob=getattr(s, "avg_logprob", None),
                                         no_speech_prob=getattr(s, "no_speech_prob", None))
                       for i, s in enumerate(result.segments)],
+            windows=[WindowTrace(start=w.start, length=w.length, consumed=w.consumed, no_speech_prob=w.no_speech_prob,
+                                 skipped=w.skipped, segments=w.segments, attempts=w.attempts)
+                     for w in getattr(result, "windows", None) or []],
         )
         job.metrics = InferenceMetrics(
             audio_seconds=round(seconds, 2),

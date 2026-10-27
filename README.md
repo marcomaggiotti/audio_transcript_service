@@ -98,6 +98,14 @@ default except the prompt, follow openai/whisper:
 Sampling uses a fixed seed, so the same audio gives the same transcript. Whether these options help
 depends on the model and the audio: measure it with the benchmark.
 
+### The decoding loop, window by window
+
+The JSON transcript also has `windows`: one entry per 30 s window, in order, with where it started (`start`, the
+seek position), how much audio it held (`length`), how far the seek moved on (`consumed`: to the last complete
+timestamp, at least 1 s), Whisper's `no_speech_prob`, whether its text was dropped as silence (`skipped`), how many
+segments it gave, and every decode (`attempts`: temperature, compression ratio, mean log-probability; with the
+temperature fallback a window can be decoded up to six times, and the last attempt is the one kept).
+
 ## Benchmark: word error rate on your own audio
 
 Speed tells you little about which model to use; accuracy on *your* audio does. The **Benchmark** tab

@@ -42,11 +42,30 @@ class InferenceMetrics(BaseModel):
     load_seconds: float | None = Field(None, description="Loading the requested model, when it isn't the service's")
 
 
+class WindowAttempt(BaseModel):
+    temperature: float
+    compression_ratio: float = Field(description="Text length / zlib-compressed length: above 2.4, a repetition loop")
+    avg_logprob: float = Field(description="Mean log-probability of the tokens: below -1, unsure")
+
+
+class WindowTrace(BaseModel):
+    """One 30 s window of the decoding loop."""
+
+    start: float = Field(description="Seconds: where the window started (the seek position)")
+    length: float = Field(description="Seconds of audio in it (30, or less at the end, padded with silence)")
+    consumed: float = Field(description="Seconds the seek moved on: to the last complete timestamp (at least 1 s)")
+    no_speech_prob: float | None = None
+    skipped: bool = Field(False, description="Its text was dropped as silence")
+    segments: int = Field(0, description="Segments it produced")
+    attempts: list[WindowAttempt] = Field(default_factory=list, description="Each decode; the last one was kept")
+
+
 class Transcript(BaseModel):
     language: str | None
     duration_seconds: float
     text: str
     segments: list[TranscriptSegment]
+    windows: list[WindowTrace] = Field(default_factory=list, description="The decoding loop, window by window")
 
 
 class Job(BaseModel):

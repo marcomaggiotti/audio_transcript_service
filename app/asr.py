@@ -76,9 +76,23 @@ class Segment:
 
 
 @dataclass
+class WindowTrace:
+    """What happened in one 30 s window: where it started, what it kept, how often it was decoded."""
+
+    start: float  # seconds: the seek position
+    length: float  # seconds of audio in the window (30, or less at the end; padded with silence to 30)
+    consumed: float  # seconds the seek moved on: to the last complete timestamp (at least 1 s)
+    no_speech_prob: float | None
+    skipped: bool  # dropped as silence
+    segments: int
+    attempts: list[dict] = field(default_factory=list)  # each decode: temperature, compression_ratio, avg_logprob
+
+
+@dataclass
 class TranscriptionResult:
     language: str | None
     segments: list[Segment] = field(default_factory=list)
+    windows: list[WindowTrace] = field(default_factory=list)
 
     @property
     def text(self) -> str:
@@ -92,6 +106,7 @@ class WindowResult:
     avg_logprob: float
     compression_ratio: float
     temperature: float
+    attempts: list[dict] = field(default_factory=list)  # every decode of this window, the last one kept
 
 
 class Transcriber(Protocol):
@@ -328,6 +343,7 @@ class OnnxWhisperTranscriber:
         previous: list[int] = []  # text tokens of the windows decoded so far, for the next prompt
         duration = audio.shape[0] / SAMPLE_RATE
         segments: list[Segment] = []
+        windows: list[WindowTrace] = []
         detected: str | None = None
         seek = 0  # in samples
 
@@ -356,6 +372,7 @@ class OnnxWhisperTranscriber:
                                                 no_speech, options, rng)
             silent = (options.temperature_fallback and no_speech is not None and no_speech > NO_SPEECH_THRESHOLD
                       and result.avg_logprob < LOGPROB_THRESHOLD)
+            kept = len(segments)
             if silent:  # Whisper's no-speech skip: drop the window's text, move past the whole window
                 result.consumed = window_seconds
                 previous = []
@@ -371,11 +388,15 @@ class OnnxWhisperTranscriber:
                     previous = (previous + [t for seg in result.segments for t in seg.tokens])[-MAX_PROMPT_TOKENS:]
                 else:
                     previous = []
-            seek += max(int(result.consumed * SAMPLE_RATE), SAMPLE_RATE)  # always move forward
+            moved = max(int(result.consumed * SAMPLE_RATE), SAMPLE_RATE)  # always move forward
+            windows.append(WindowTrace(round(offset, 2), round(window_seconds, 2), round(moved / SAMPLE_RATE, 2),
+                                       None if no_speech is None else round(no_speech, 4), silent,
+                                       len(segments) - kept, result.attempts))
+            seek += moved
             if on_progress:
                 on_progress(min(1.0, seek / audio.shape[0]))
 
-        return TranscriptionResult(language=detected or language, segments=segments)
+        return TranscriptionResult(language=detected or language, segments=segments, windows=windows)
 
     def detect_language(self, encoded: np.ndarray) -> str | None:
         if not self.tokens.multilingual:
@@ -460,8 +481,12 @@ class OnnxWhisperTranscriber:
                               previous: list[int], no_speech: float | None, options: DecodingOptions,
                               rng: np.random.Generator) -> WindowResult:
         temperatures = FALLBACK_TEMPERATURES if options.temperature_fallback else (0.0,)
+        tried: list[dict] = []
         for temperature in temperatures:
             result = self._decode_window(encoded, language, window_seconds, previous, temperature, rng)
+            tried.append({"temperature": temperature, "compression_ratio": round(result.compression_ratio, 3),
+                          "avg_logprob": round(result.avg_logprob, 4)})
+            result.attempts = tried
             looks_wrong = (result.compression_ratio > COMPRESSION_RATIO_THRESHOLD
                            or result.avg_logprob < LOGPROB_THRESHOLD)
             if not looks_wrong or (no_speech is not None and no_speech > NO_SPEECH_THRESHOLD):
