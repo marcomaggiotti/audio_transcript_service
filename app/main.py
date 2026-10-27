@@ -2,6 +2,7 @@
 
 import asyncio
 import hmac
+import json
 import logging
 import shutil
 import uuid
@@ -13,7 +14,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
-from app.asr import OnnxWhisperTranscriber, Transcriber
+from app.asr import MAX_INTERVALS, OnnxWhisperTranscriber, Transcriber
 from app.audio import MEDIA_TYPES, InvalidAudioError, decode_audio, detect_format, duration_seconds
 from app.benchmark import (
     VARIANTS,
@@ -215,7 +216,8 @@ def create_app(settings: Settings | None = None, components: Components | None =
     def submit_job(service: TranscriptionService, job_id: str, filename: str, size: int, language: str,
                    temperature_fallback: bool | None = None, condition_on_previous_text: bool | None = None,
                    initial_prompt: str | None = None, encoder: str | None = None,
-                   decoder: str | None = None, model: str | None = None) -> Job:
+                   decoder: str | None = None, model: str | None = None,
+                   intervals: list[tuple[float, float]] | None = None) -> Job:
         """Queue the audio at service.upload_path(job_id), with the default decoding options unless given."""
         job = Job(
             id=job_id, filename=filename, size_bytes=size, language=None if language == "auto" else language,
@@ -226,6 +228,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
             initial_prompt=(initial_prompt or settings.initial_prompt or "").strip() or None,
             encoder_precision=encoder, decoder_precision=decoder,
             requested_model=service.models.find(model).id if model else None,
+            intervals=intervals,
         )
         try:
             service.submit(job)
@@ -236,11 +239,35 @@ def create_app(settings: Settings | None = None, components: Components | None =
     async def accept_upload(service: TranscriptionService, file: UploadFile, language: str | None,
                             **options) -> Job:
         """Validate and store the upload, then queue it as a job."""
+        options["intervals"] = parse_intervals(options.get("intervals"))
         language = check_ready(service, language, options.get("model"))
         check_model(service, options.get("model"), language, options.get("encoder"), options.get("decoder"))
         job_id = uuid.uuid4().hex
         size = await save_upload(file, service.upload_path(job_id))
         return submit_job(service, job_id, file.filename or "audio", size, language, **options)
+
+    def parse_intervals(raw: str | None) -> list[tuple[float, float]] | None:
+        """The `intervals` form field: a JSON list of [start, end] pairs in seconds, in order, not overlapping."""
+        if raw is None or not raw.strip():
+            return None
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            raise HTTPException(422, "intervals must be JSON, e.g. [[0, 12.5], [12.5, 30]]")
+        if not isinstance(value, list) or not value or len(value) > MAX_INTERVALS:
+            raise HTTPException(422, f"intervals must be a list of 1 to {MAX_INTERVALS} [start, end] pairs")
+        out: list[tuple[float, float]] = []
+        for pair in value:
+            if (not isinstance(pair, list) or len(pair) != 2
+                    or not all(isinstance(t, (int, float)) and not isinstance(t, bool) for t in pair)):
+                raise HTTPException(422, "each interval must be [start, end] in seconds")
+            start, end = float(pair[0]), float(pair[1])
+            if start < 0 or end <= start:
+                raise HTTPException(422, f"interval [{start}, {end}] must have 0 <= start < end")
+            if out and start < out[-1][1] - 0.01:
+                raise HTTPException(422, "intervals must be in order and must not overlap")
+            out.append((start, end))
+        return out
 
     def render(job: Job, fmt: OutputFormat):
         if fmt == OutputFormat.json:
@@ -269,6 +296,11 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          description="Encoder precision: fp32 (full, the default) or int8 (smaller, less accurate)")
     decoder_param = Form(None, pattern=r"^(fp32|int8)$",
                          description="Decoder precision: int8 (the default) or fp32 (full)")
+    intervals_param = Form(None, max_length=200_000,
+                           description="JSON [[start, end], ...] in seconds: transcribe each span on its own, with no "
+                                       "text carried between them, and return exactly one segment per span with its "
+                                       "times (empty text where nothing was heard). For transcribing a copy of a "
+                                       "recording on the original's lines")
     model_param = Form(None, max_length=200,
                        description="Model for this job, e.g. openai/whisper-small (see GET /config); default: the "
                                    "service's. Another model is loaded for the job and released after it")
@@ -281,12 +313,14 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          format: OutputFormat = format_param, temperature_fallback: bool | None = fallback_param,
                          condition_on_previous_text: bool | None = previous_param,
                          initial_prompt: str | None = prompt_param, encoder: str | None = encoder_param,
-                         decoder: str | None = decoder_param, model: str | None = model_param):
+                         decoder: str | None = decoder_param, model: str | None = model_param,
+                         intervals: str | None = intervals_param):
         """Upload audio and wait for its transcript. Shares the job queue, so it waits its turn."""
         service = service_of(request)
         job = await accept_upload(service, file, language, temperature_fallback=temperature_fallback,
                                   condition_on_previous_text=condition_on_previous_text,
-                                  initial_prompt=initial_prompt, encoder=encoder, decoder=decoder, model=model)
+                                  initial_prompt=initial_prompt, encoder=encoder, decoder=decoder, model=model,
+                                  intervals=intervals)
         try:
             job = await service.wait(job.id)
         finally:
@@ -303,14 +337,16 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          temperature_fallback: bool | None = fallback_param,
                          condition_on_previous_text: bool | None = previous_param,
                          initial_prompt: str | None = prompt_param, encoder: str | None = encoder_param,
-                         decoder: str | None = decoder_param, model: str | None = model_param):
+                         decoder: str | None = decoder_param, model: str | None = model_param,
+                         intervals: str | None = intervals_param):
         """Upload audio for background transcription; poll the status URL, then fetch the transcript.
 
         `model` picks the speech model and `encoder` / `decoder` the precision of each part for this job (see
         GET /config for what this deployment has); anything not loaded is loaded for the job and released after."""
         job = await accept_upload(service_of(request), file, language, temperature_fallback=temperature_fallback,
                                   condition_on_previous_text=condition_on_previous_text,
-                                  initial_prompt=initial_prompt, encoder=encoder, decoder=decoder, model=model)
+                                  initial_prompt=initial_prompt, encoder=encoder, decoder=decoder, model=model,
+                                  intervals=intervals)
         return summary(job)
 
     @app.get("/jobs", response_model=list[JobSummary])

@@ -24,7 +24,7 @@ import os
 import zlib
 from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -96,7 +96,7 @@ class TranscriptionResult:
 
     @property
     def text(self) -> str:
-        return " ".join(s.text for s in self.segments).strip()
+        return " ".join(s.text.strip() for s in self.segments if s.text.strip())
 
 
 @dataclass
@@ -115,6 +115,42 @@ class Transcriber(Protocol):
     def transcribe(self, audio: np.ndarray, language: str | None = None,
                    on_progress: Callable[[float], None] | None = None,
                    options: DecodingOptions | None = None) -> TranscriptionResult: ...
+
+
+MAX_INTERVALS = 5000
+
+
+def transcribe_intervals(transcriber: Transcriber, audio: np.ndarray, intervals: list[tuple[float, float]],
+                         language: str | None = None, on_progress: Callable[[float], None] | None = None,
+                         options: DecodingOptions | None = None) -> TranscriptionResult:
+    """Transcribe each [start, end) of the audio on its own and return exactly one segment per interval, with the
+    interval's own times (its text empty when Whisper heard nothing). Nothing is carried from one interval to the
+    next (no previous-text prompt), so text can't leak across them: for transcribing a copy of a recording on the
+    original's lines. The first interval's detected language is used for the rest."""
+    options = replace(options or DecodingOptions(), condition_on_previous_text=False)
+    duration = audio.shape[0] / SAMPLE_RATE
+    segments: list[Segment] = []
+    windows: list[WindowTrace] = []
+    detected = None if language in (None, "", "auto") else language
+    for k, (start, end) in enumerate(intervals):
+        start, end = max(0.0, float(start)), min(float(end), duration)
+        piece = audio[int(start * SAMPLE_RATE) : int(end * SAMPLE_RATE)]
+        if end - start >= 0.1 and piece.shape[0]:
+            result = transcriber.transcribe(piece, language=detected, options=options)
+            detected = detected or result.language
+            texts = [s.text.strip() for s in result.segments if s.text.strip()]
+            logprobs = [s.avg_logprob for s in result.segments if s.avg_logprob is not None]
+            no_speech = [s.no_speech_prob for s in result.segments if s.no_speech_prob is not None]
+            segments.append(Segment(round(start, 2), round(max(end, start), 2), " ".join(texts),
+                                    round(sum(logprobs) / len(logprobs), 4) if logprobs else None,
+                                    max(no_speech) if no_speech else None,
+                                    [t for s in result.segments for t in s.tokens]))
+            windows += [replace(w, start=round(start + w.start, 2)) for w in getattr(result, "windows", None) or []]
+        else:  # outside the audio, or too short to decode
+            segments.append(Segment(round(min(start, duration), 2), round(max(end, min(start, duration)), 2), ""))
+        if on_progress:
+            on_progress((k + 1) / len(intervals))
+    return TranscriptionResult(language=detected, segments=segments, windows=windows)
 
 
 class ModelLoadError(RuntimeError):

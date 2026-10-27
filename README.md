@@ -106,6 +106,16 @@ timestamp, at least 1 s), Whisper's `no_speech_prob`, whether its text was dropp
 segments it gave, and every decode (`attempts`: temperature, compression ratio, mean log-probability; with the
 temperature fallback a window can be decoded up to six times, and the last attempt is the one kept).
 
+### Transcribing on given intervals
+
+`POST /transcribe` and `POST /jobs` take an optional `intervals` field: a JSON list of `[start, end]` pairs in seconds,
+in order and not overlapping, e.g. `[[0, 12.4], [12.4, 31]]`. Each span is then transcribed on its own, with no
+text carried from one span to the next (`condition_on_previous_text` is off for them), and the transcript has exactly
+one segment per span, at the span's times: its text is everything Whisper heard in it, empty when it heard nothing.
+This is for transcribing an edited copy of a recording (cleaned, equalized) on the original's lines, so the two
+transcripts line up row by row and no words spill from one line into the next. `windows` then lists the windows of
+every span, at their place in the whole audio.
+
 ## Benchmark: word error rate on your own audio
 
 Speed tells you little about which model to use; accuracy on *your* audio does. The **Benchmark** tab

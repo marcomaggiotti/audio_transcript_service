@@ -83,6 +83,8 @@ class Job(BaseModel):
     encoder_precision: str | None = Field(None, description="Requested encoder precision (fp32, int8); None = default")
     decoder_precision: str | None = Field(None, description="Requested decoder precision (fp32, int8); None = default")
     requested_model: str | None = Field(None, description="Requested model (e.g. openai/whisper-small); None = the service's")
+    intervals: list[tuple[float, float]] | None = Field(
+        None, description="Transcribe only these [start, end] spans, each on its own: one segment per span")
     precision: dict[str, str] | None = Field(None, description="Precision actually used: {encoder, decoder}")
     error: str | None = None
     model: str | None = None

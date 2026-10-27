@@ -14,7 +14,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 
-from app.asr import DecodingOptions, Transcriber
+from app.asr import DecodingOptions, Transcriber, transcribe_intervals
 from app.audio import InvalidAudioError, decode_audio, duration_seconds
 from app.metrics import peak_memory_mb
 from app.models import ModelSet
@@ -190,18 +190,21 @@ class TranscriptionService:
             # The service's model, or the one the job asked for, loaded for it and released after it.
             with self.models.use(job.requested_model, on_load=loading) as transcriber:
                 job.stage = "transcribing"
+                if job.intervals:  # one segment per requested span, nothing carried between them
+                    def run(audio, language, on_progress, options, _t=transcriber):
+                        return transcribe_intervals(_t, audio, job.intervals, language, on_progress, options)
+                else:
+                    run = transcriber.transcribe
                 t_load = time.perf_counter()  # inference is timed from here: loading isn't inference
                 job.model = transcriber.name
                 switch = getattr(transcriber, "precision_for", None)  # absent on test fakes
                 if switch is None:
                     job.precision = getattr(transcriber, "precision", None)
-                    result = transcriber.transcribe(audio, language=job.language, on_progress=progress,
-                                                    options=options)
+                    result = run(audio, language=job.language, on_progress=progress, options=options)
                 else:
                     with switch(job.encoder_precision, job.decoder_precision) as used:
                         job.precision = used
-                        result = transcriber.transcribe(audio, language=job.language, on_progress=progress,
-                                                        options=options)
+                        result = run(audio, language=job.language, on_progress=progress, options=options)
             t2 = time.perf_counter()
         except Exception as e:
             logger.exception("Transcription failed for %s", job_id)

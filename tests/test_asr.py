@@ -252,3 +252,33 @@ def test_precision_swaps_parts_for_one_job_and_back(tmp_path):
     with pytest.raises(ValueError, match="encoder precision fp16 isn't available"):
         with t.precision_for("fp16", None):
             pass
+
+
+def test_transcribe_intervals_one_segment_per_span():
+    from app.asr import DecodingOptions, Segment, TranscriptionResult, WindowTrace, transcribe_intervals
+
+    class Recorder:
+        def __init__(self):
+            self.lengths, self.languages = [], []
+
+        def transcribe(self, audio, language=None, on_progress=None, options=None):
+            assert options.condition_on_previous_text is False
+            self.lengths.append(round(audio.shape[0] / 16000, 2))
+            self.languages.append(language)
+            return TranscriptionResult(language=language or "it", segments=[
+                Segment(0.0, 1.0, " uno", -0.2, 0.1), Segment(1.0, 2.0, "due ", -0.4, 0.3)],
+                windows=[WindowTrace(0.0, 2.0, 2.0, 0.1, False, 2)])
+
+    rec = Recorder()
+    audio = np.zeros(16000 * 10, dtype=np.int16)
+    shares = []
+    result = transcribe_intervals(rec, audio, [(0.0, 4.0), (4.0, 9.5), (9.5, 12.0)], None, shares.append,
+                                  DecodingOptions(condition_on_previous_text=True))
+    assert [(s.start, s.end, s.text) for s in result.segments] == [
+        (0.0, 4.0, "uno due"), (4.0, 9.5, "uno due"), (9.5, 10.0, "uno due")]  # clamped to the audio's end
+    assert result.segments[0].avg_logprob == -0.3 and result.segments[0].no_speech_prob == 0.3
+    assert rec.lengths == [4.0, 5.5, 0.5]
+    assert rec.languages == [None, "it", "it"]  # detected once, then kept
+    assert [w.start for w in result.windows] == [0.0, 4.0, 9.5]
+    assert shares[-1] == 1.0
+    assert result.text == "uno due uno due uno due"
