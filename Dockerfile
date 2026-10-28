@@ -22,6 +22,14 @@ RUN python export_whisper_onnx.py --model "$WHISPER_MODEL" --output /models/whis
  && for model in $BENCHMARK_MODELS; do \
       python export_whisper_onnx.py --model "$model" --output "/models/$(basename "$model")" --prune; \
     done
+# Silero VAD (MIT licence, 2 MB) for voice activity detection: the ONNX file from its pinned PyPI release.
+ARG SILERO_VAD_VERSION=5.1.2
+ARG SILERO_VAD_SHA256=2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f
+RUN pip download --no-cache-dir --no-deps "silero-vad==$SILERO_VAD_VERSION" -d /tmp/vad \
+ && python -m zipfile -e /tmp/vad/silero_vad-*.whl /tmp/vad/wheel \
+ && mkdir -p /models/vad && cp /tmp/vad/wheel/silero_vad/data/silero_vad.onnx /models/vad/ \
+ && echo "$SILERO_VAD_SHA256  /models/vad/silero_vad.onnx" | sha256sum -c - \
+ && rm -rf /tmp/vad
 
 # Stage 2: runtime with ONNX Runtime only
 FROM python:3.12-slim
@@ -43,6 +51,7 @@ COPY main.py .
 # Models stay under /app/models: a disk mounted at /data would hide whatever the image has there.
 ENV WHISPER_MODEL_DIR=/app/models/whisper \
     MODELS_DIR=/app/models \
+    VAD_MODEL_PATH=/app/models/vad/silero_vad.onnx \
     BENCHMARK_DIR=/data/benchmark \
     UPLOAD_DIR=/tmp/uploads \
     PORT=10000

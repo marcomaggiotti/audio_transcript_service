@@ -14,7 +14,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
-from app.asr import MAX_INTERVALS, OnnxWhisperTranscriber, Transcriber
+from app.asr import MAX_BEAM_SIZE, MAX_INTERVALS, OnnxWhisperTranscriber, Transcriber
 from app.audio import MEDIA_TYPES, InvalidAudioError, decode_audio, detect_format, duration_seconds
 from app.benchmark import (
     VARIANTS,
@@ -28,6 +28,7 @@ from app.config import Settings, get_settings
 from app.formats import RENDERERS
 from app.jobs import JobNotFound, QueueFullError, TranscriptionService
 from app.models import ModelSet, ModelUnavailable, memory_limit_mb
+from app.vad import MAX_PIECE_SECONDS, SPEECH_PAD_MS, load_vad
 from app.schemas import (
     BenchmarkCreate,
     BenchmarkModel,
@@ -77,6 +78,8 @@ class Components:
     load_model: Callable[[Path], Transcriber] | None = None
     # The container's memory in MB, for the "does this model fit" check (tests set it); default: from cgroups.
     memory_limit_mb: float | None = None
+    # Voice activity detection (tests pass a fake); default: Silero VAD from VAD_MODEL_PATH, if it's there.
+    vad: object | None = None
 
 
 def _clock(seconds: float) -> str:
@@ -111,14 +114,18 @@ def create_app(settings: Settings | None = None, components: Components | None =
                           components.load_model or load_model,
                           limit_mb=components.memory_limit_mb if components.memory_limit_mb is not None
                           else memory_limit_mb())
+        vad, vad_error = (components.vad, None) if components.vad is not None else load_vad(settings.vad_model_path)
+        if vad_error:
+            logger.warning("Voice activity detection unavailable: %s", vad_error)
         service = TranscriptionService(
             transcriber, settings.upload_dir, transcriber_error,
             max_audio_seconds=settings.max_audio_seconds,
             concurrency=settings.worker_concurrency,
             max_queue_size=settings.max_queue_size,
             max_finished_jobs=settings.max_finished_jobs,
-            models=models,
+            models=models, vad=vad,
         )
+        service.vad_error = vad_error
         app.state.service = service
         await service.start()
 
@@ -127,7 +134,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
         app.state.benchmark = BenchmarkRunner(
             store, service.submit_task,
             (Path(settings.whisper_model_dir).name, transcriber) if transcriber else None,
-            settings.models_dir, components.load_model or load_model,
+            settings.models_dir, components.load_model or load_model, vad=vad,
         )
         app.state.benchmark.recover()
         yield
@@ -217,7 +224,9 @@ def create_app(settings: Settings | None = None, components: Components | None =
                    temperature_fallback: bool | None = None, condition_on_previous_text: bool | None = None,
                    initial_prompt: str | None = None, encoder: str | None = None,
                    decoder: str | None = None, model: str | None = None,
-                   intervals: list[tuple[float, float]] | None = None) -> Job:
+                   intervals: list[tuple[float, float]] | None = None, beam_size: int | None = None,
+                   reset_on_loop: bool | None = None, vad: bool | None = None, vad_threshold: float | None = None,
+                   vad_min_silence_ms: int | None = None) -> Job:
         """Queue the audio at service.upload_path(job_id), with the default decoding options unless given."""
         job = Job(
             id=job_id, filename=filename, size_bytes=size, language=None if language == "auto" else language,
@@ -229,7 +238,15 @@ def create_app(settings: Settings | None = None, components: Components | None =
             encoder_precision=encoder, decoder_precision=decoder,
             requested_model=service.models.find(model).id if model else None,
             intervals=intervals,
+            beam_size=settings.beam_size if beam_size is None else beam_size,
+            reset_on_loop=settings.reset_prompt_on_loop if reset_on_loop is None else reset_on_loop,
+            vad=settings.vad if vad is None else vad,
+            vad_threshold=settings.vad_threshold if vad_threshold is None else vad_threshold,
+            vad_min_silence_ms=settings.vad_min_silence_ms if vad_min_silence_ms is None else vad_min_silence_ms,
         )
+        if job.vad and service.vad is None:
+            raise HTTPException(503, "Voice activity detection is unavailable on this service: "
+                                     f"{service.vad_error or 'not loaded'}; send vad=false")
         try:
             service.submit(job)
         except QueueFullError as e:
@@ -301,6 +318,17 @@ def create_app(settings: Settings | None = None, components: Components | None =
                                        "text carried between them, and return exactly one segment per span with its "
                                        "times (empty text where nothing was heard). For transcribing a copy of a "
                                        "recording on the original's lines")
+    beam_param = Form(None, ge=1, le=MAX_BEAM_SIZE,
+                      description="Beam search: candidate texts kept at temperature 0 (1 = greedy; openai/whisper: 5). "
+                                  "Fewer word errors, decoder about 3-5x slower (default: BEAM_SIZE)")
+    reset_param = Form(None, description="With previous text on: don't prompt the next window with one whose text "
+                                         "loops (default: RESET_PROMPT_ON_LOOP)")
+    vad_param = Form(None, description="Voice activity detection: transcribe only the speech, cut at pauses into "
+                                       "pieces up to 30 s (default: VAD)")
+    vad_threshold_param = Form(None, ge=0.1, le=0.95, description="VAD: speech probability above which a 32 ms frame "
+                                                                  "is speech (default: VAD_THRESHOLD, 0.5)")
+    vad_silence_param = Form(None, ge=100, le=5000, description="VAD: a pause at least this long (ms) ends a stretch "
+                                                                "of speech (default: VAD_MIN_SILENCE_MS, 500)")
     model_param = Form(None, max_length=200,
                        description="Model for this job, e.g. openai/whisper-small (see GET /config); default: the "
                                    "service's. Another model is loaded for the job and released after it")
@@ -314,13 +342,17 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          condition_on_previous_text: bool | None = previous_param,
                          initial_prompt: str | None = prompt_param, encoder: str | None = encoder_param,
                          decoder: str | None = decoder_param, model: str | None = model_param,
-                         intervals: str | None = intervals_param):
+                         intervals: str | None = intervals_param, beam_size: int | None = beam_param,
+                         reset_on_loop: bool | None = reset_param, vad: bool | None = vad_param,
+                         vad_threshold: float | None = vad_threshold_param,
+                         vad_min_silence_ms: int | None = vad_silence_param):
         """Upload audio and wait for its transcript. Shares the job queue, so it waits its turn."""
         service = service_of(request)
         job = await accept_upload(service, file, language, temperature_fallback=temperature_fallback,
                                   condition_on_previous_text=condition_on_previous_text,
                                   initial_prompt=initial_prompt, encoder=encoder, decoder=decoder, model=model,
-                                  intervals=intervals)
+                                  intervals=intervals, beam_size=beam_size, reset_on_loop=reset_on_loop, vad=vad,
+                                  vad_threshold=vad_threshold, vad_min_silence_ms=vad_min_silence_ms)
         try:
             job = await service.wait(job.id)
         finally:
@@ -338,7 +370,10 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          condition_on_previous_text: bool | None = previous_param,
                          initial_prompt: str | None = prompt_param, encoder: str | None = encoder_param,
                          decoder: str | None = decoder_param, model: str | None = model_param,
-                         intervals: str | None = intervals_param):
+                         intervals: str | None = intervals_param, beam_size: int | None = beam_param,
+                         reset_on_loop: bool | None = reset_param, vad: bool | None = vad_param,
+                         vad_threshold: float | None = vad_threshold_param,
+                         vad_min_silence_ms: int | None = vad_silence_param):
         """Upload audio for background transcription; poll the status URL, then fetch the transcript.
 
         `model` picks the speech model and `encoder` / `decoder` the precision of each part for this job (see
@@ -346,7 +381,8 @@ def create_app(settings: Settings | None = None, components: Components | None =
         job = await accept_upload(service_of(request), file, language, temperature_fallback=temperature_fallback,
                                   condition_on_previous_text=condition_on_previous_text,
                                   initial_prompt=initial_prompt, encoder=encoder, decoder=decoder, model=model,
-                                  intervals=intervals)
+                                  intervals=intervals, beam_size=beam_size, reset_on_loop=reset_on_loop, vad=vad,
+                                  vad_threshold=vad_threshold, vad_min_silence_ms=vad_min_silence_ms)
         return summary(job)
 
     @app.get("/jobs", response_model=list[JobSummary])
@@ -604,6 +640,13 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          "logprob_threshold": asr.LOGPROB_THRESHOLD, "no_speech_threshold": asr.NO_SPEECH_THRESHOLD,
                          "condition_on_previous_text": settings.condition_on_previous_text,
                          "initial_prompt": settings.initial_prompt,
+                         "beam_size": settings.beam_size, "max_beam_size": asr.MAX_BEAM_SIZE,
+                         "reset_prompt_on_loop": settings.reset_prompt_on_loop,
+                         "vad": {"default": settings.vad, "available": service.vad is not None,
+                                 "error": service.vad_error, "model": "Silero VAD v5 (ONNX)",
+                                 "threshold": settings.vad_threshold,
+                                 "min_silence_ms": settings.vad_min_silence_ms,
+                                 "speech_pad_ms": SPEECH_PAD_MS, "max_piece_seconds": MAX_PIECE_SECONDS},
                          "timestamp_precision_seconds": asr.TIME_PRECISION},
         }
 

@@ -46,6 +46,7 @@ class WindowAttempt(BaseModel):
     temperature: float
     compression_ratio: float = Field(description="Text length / zlib-compressed length: above 2.4, a repetition loop")
     avg_logprob: float = Field(description="Mean log-probability of the tokens: below -1, unsure")
+    beam_size: int = Field(1, description="Candidate texts kept (1 = greedy or sampled)")
 
 
 class WindowTrace(BaseModel):
@@ -58,6 +59,7 @@ class WindowTrace(BaseModel):
     skipped: bool = Field(False, description="Its text was dropped as silence")
     segments: int = Field(0, description="Segments it produced")
     attempts: list[WindowAttempt] = Field(default_factory=list, description="Each decode; the last one was kept")
+    prompt_reset: bool = Field(False, description="Its text looped, so the next window wasn't prompted with it")
 
 
 class Transcript(BaseModel):
@@ -66,6 +68,8 @@ class Transcript(BaseModel):
     text: str
     segments: list[TranscriptSegment]
     windows: list[WindowTrace] = Field(default_factory=list, description="The decoding loop, window by window")
+    speech: list[tuple[float, float]] | None = Field(
+        None, description="With VAD: the stretches of speech Whisper heard, [start, end] in seconds")
 
 
 class Job(BaseModel):
@@ -83,6 +87,11 @@ class Job(BaseModel):
     encoder_precision: str | None = Field(None, description="Requested encoder precision (fp32, int8); None = default")
     decoder_precision: str | None = Field(None, description="Requested decoder precision (fp32, int8); None = default")
     requested_model: str | None = Field(None, description="Requested model (e.g. openai/whisper-small); None = the service's")
+    beam_size: int = Field(1, description="Candidate texts kept at temperature 0 (1 = greedy)")
+    reset_on_loop: bool = Field(True, description="Don't prompt the next window with one whose text loops")
+    vad: bool = Field(False, description="Transcribe only the speech voice activity detection finds")
+    vad_threshold: float = Field(0.5, description="Speech probability above which a 32 ms frame is speech")
+    vad_min_silence_ms: int = Field(500, description="A pause at least this long ends a stretch of speech")
     intervals: list[tuple[float, float]] | None = Field(
         None, description="Transcribe only these [start, end] spans, each on its own: one segment per span")
     precision: dict[str, str] | None = Field(None, description="Precision actually used: {encoder, decoder}")
@@ -175,6 +184,8 @@ class BenchmarkVariant(BaseModel):
     label: str
     temperature_fallback: bool
     condition_on_previous_text: bool
+    beam_size: int = 1
+    vad: bool = False
 
 
 class BenchmarkCreate(BaseModel):

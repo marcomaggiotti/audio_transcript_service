@@ -34,7 +34,7 @@ This service keeps only that part. It has no search or embeddings.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/transcribe?format=json\|text\|srt\|vtt` | Multipart `file` (WAV, MP3, OGG/Opus, M4A, FLAC) and optional `language` (`en`, `de`, `it`, … or `auto`), `temperature_fallback`, `condition_on_previous_text` (`true`/`false`) and `initial_prompt`. Waits and returns the transcript |
+| `POST` | `/transcribe?format=json\|text\|srt\|vtt` | Multipart `file` (WAV, MP3, OGG/Opus, M4A, FLAC) and optional `language` (`en`, `de`, `it`, … or `auto`), `temperature_fallback`, `condition_on_previous_text`, `reset_on_loop`, `vad` (`true`/`false`), `vad_threshold`, `vad_min_silence_ms`, `beam_size`, `initial_prompt` and `intervals`. Waits and returns the transcript |
 | `POST` | `/jobs` | Same upload, transcribed in the background. Returns `202` with the job id, `status_url` and `transcript_url` |
 | `GET` | `/jobs` | Recent jobs, newest first |
 | `GET` | `/jobs/{id}` | Status, `stage` (decoding, transcribing), `progress` (0–1, updated after each 30 s window), `queue_position` while queued, model, timings and metrics, or the error if it failed |
@@ -81,8 +81,8 @@ wrong. `no_speech_prob` is Whisper's estimate that the segment's 30 s window is 
 
 ## Decoding options
 
-Each 30 s window is decoded greedily (the most likely token each step). Three options, all on by
-default except the prompt, follow openai/whisper:
+Each 30 s window is decoded greedily (the most likely token each step) unless beam search is asked for. These
+options follow openai/whisper:
 
 - **Temperature fallback** (`TEMPERATURE_FALLBACK`, form field `temperature_fallback`): a window whose
   text repeats itself (zlib compression ratio above 2.4) or whose tokens are unsure (mean log-probability
@@ -91,7 +91,23 @@ default except the prompt, follow openai/whisper:
   hallucinations and repetition loops, at the cost of extra decoding on bad windows only.
 - **Previous-text prompt** (`CONDITION_ON_PREVIOUS_TEXT`, `condition_on_previous_text`): each window is
   prompted with the text decoded before it (up to 223 tokens), which keeps names and spelling consistent.
-  It's dropped after a window that needed a high temperature, so one bad window doesn't spread.
+  It's dropped after a window that needed a high temperature, and (`RESET_PROMPT_ON_LOOP`, `reset_on_loop`,
+  on by default) after a window whose text loops (compression ratio above 2.4), so one mistake doesn't spread
+  and a loop doesn't snowball into the next window. The window trace marks such a window `prompt_reset`. With a
+  small model such as whisper-tiny, turning previous text off altogether is often better: measure it.
+- **Beam search** (`BEAM_SIZE`, `beam_size`, default 1 = greedy, up to 8): at temperature 0 the decoder keeps that
+  many candidate texts in parallel and picks the one with the best mean log-probability per token, as openai/whisper
+  does with 5. Usually noticeably fewer word errors, more so on a weak model; the decoder is about 3-5x slower (the
+  encoder is unchanged). Fallback attempts at higher temperatures still sample one text.
+- **Voice activity detection** (`VAD`, `vad`, off by default; `vad_threshold`, `vad_min_silence_ms`): Silero VAD
+  (MIT licence, a 2 MB ONNX model at `VAD_MODEL_PATH`, put in the image by the Dockerfile) gives each 32 ms of audio
+  a speech probability. Stretches of speech (padded by 200 ms, ended by a pause of at least `vad_min_silence_ms`,
+  default 500) are grouped into pieces of up to 29 s, cut at pauses, and only those are transcribed, the silence
+  between them left out. Whisper hears only speech, which removes most invented phrases ("Thanks for watching")
+  and many loops, since those start in silence and noise; no word is split at a fixed window edge; and silence
+  costs no decoding time. Segment times are mapped back to the recording, and the transcript lists the stretches
+  of speech (`speech`). Detection takes about 1 s per 4 minutes of audio. Without the model file a request with
+  `vad=true` is refused (503); `GET /config` says whether VAD is available.
 - **Initial prompt** (`INITIAL_PROMPT`, `initial_prompt`): words and spellings the audio contains, such as
   names and product terms, given to every window.
 
@@ -254,6 +270,9 @@ pytest
 | `ONNX_THREADS` | `0` (auto) | ONNX Runtime threads; set to the instance's CPU count |
 | `WHISPER_LOW_MEMORY` | `false` | About 25 MB less RAM, about 1.5x slower transcription |
 | `TEMPERATURE_FALLBACK` / `CONDITION_ON_PREVIOUS_TEXT` | `true` / `true` | Decoding defaults; requests can override them |
+| `BEAM_SIZE` / `RESET_PROMPT_ON_LOOP` | `1` / `true` | Beam search width (1 = greedy); stop carrying text after a loop |
+| `VAD` / `VAD_THRESHOLD` / `VAD_MIN_SILENCE_MS` | `false` / `0.5` / `500` | Voice activity detection defaults; requests can override them |
+| `VAD_MODEL_PATH` | `./models/vad/silero_vad.onnx` | Silero VAD model (the Docker image has it) |
 | `INITIAL_PROMPT` | – | Default initial prompt (names, terms) |
 | `MODELS_DIR` | `./models` | Exports jobs can choose (`model=`) and the benchmark can compare |
 | `EXTRA_MODELS` | – | Build arg: more models exported into the image for jobs, e.g. `openai/whisper-small` |

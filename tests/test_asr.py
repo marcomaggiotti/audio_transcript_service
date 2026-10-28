@@ -282,3 +282,106 @@ def test_transcribe_intervals_one_segment_per_span():
     assert [w.start for w in result.windows] == [0.0, 4.0, 9.5]
     assert shares[-1] == 1.0
     assert result.text == "uno due uno due uno due"
+
+
+# ----------------------------------------------------------------- beam search
+
+# A first word that looks best on its own ("hello", barely ahead of "onnx") but leads to unsure words, against one
+# that leads to a sure text: greedy takes the first, beam search the second.
+BEAM_TABLE = {
+    (): {ts(0): 10},
+    (ts(0),): {0: 2.0, 2: 1.9},
+    (ts(0), 0): {1: 1.0, 4: 1.0, 5: 1.0, 6: 1.0},
+    (ts(0), 0, 1): {ts(2.0): 10}, (ts(0), 0, 4): {ts(2.0): 10}, (ts(0), 0, 5): {ts(2.0): 10},
+    (ts(0), 2): {3: 10},
+    (ts(0), 2, 3): {ts(2.0): 10},
+}
+
+
+def table_logits(ids: list[int]) -> np.ndarray:
+    logits = np.full(VOCAB, -30.0, dtype=np.float32)
+    if ids == [SOT]:
+        return logits
+    sampled = tuple(ids[ids.index(SOT) + 3:])
+    for token, value in BEAM_TABLE.get(sampled, {EOT: 10}).items():
+        logits[token] = value
+    return logits
+
+
+class TableDecoder:
+    """No KV cache: every call gets the whole prefix."""
+
+    def get_inputs(self):
+        return [SimpleNamespace(name="input_ids"), SimpleNamespace(name="encoder_hidden_states")]
+
+    def run(self, outputs, feeds):
+        return [table_logits(feeds["input_ids"][0].tolist())[None, None, :]]
+
+
+class CachedTableDecoder:
+    """A merged decoder whose self-attention "K/V" is the token history itself: a beam that forked wrongly (shared
+    or lost cache) would see the wrong history and get the wrong logits."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def get_inputs(self):
+        return [SimpleNamespace(name="input_ids"), SimpleNamespace(name="encoder_hidden_states"),
+                SimpleNamespace(name="use_cache_branch"),
+                SimpleNamespace(name="past_key_values.0.decoder.key", shape=[None, 1, None, 1]),
+                SimpleNamespace(name="past_key_values.0.encoder.key", shape=[None, 1, None, 1])]
+
+    def get_outputs(self):
+        return [SimpleNamespace(name=n) for n in ("logits", "present.0.decoder.key", "present.0.encoder.key")]
+
+    def run(self, outputs, feeds):
+        self.calls += 1
+        history = feeds["past_key_values.0.decoder.key"][0, 0, :, 0].astype(int).tolist()
+        assert bool(feeds["use_cache_branch"][0]) == bool(history)
+        ids = history + feeds["input_ids"][0].tolist()
+        present = np.array(ids, dtype=np.float32)[None, None, :, None]
+        return [table_logits(ids)[None, None, :], present, np.zeros((1, 1, 1, 1), dtype=np.float32)]
+
+
+def make_table(decoder):
+    tokens = WhisperTokens(eot=EOT, sot=SOT, transcribe=TRANSCRIBE, no_timestamps=NO_TS, timestamp_begin=TS,
+                           lang_to_id={"en": EN, "de": DE}, suppress=[], prev=PREV)
+    return OnnxWhisperTranscriber(FakeEncoder(), decoder, FakeTokenizer(), tokens)
+
+
+@pytest.mark.parametrize("decoder", [TableDecoder, CachedTableDecoder])
+def test_beam_search_finds_the_more_likely_text(decoder):
+    audio = np.zeros(16000 * 3, dtype=np.float32)
+    greedy = make_table(decoder()).transcribe(audio, "en")
+    assert greedy.text == "hello world"
+    beam = make_table(decoder()).transcribe(audio, "en", options=DecodingOptions(beam_size=3))
+    assert beam.text == "onnx runtime"
+    assert [(s.start, s.end) for s in beam.segments] == [(0.0, 2.0)]
+    assert beam.segments[0].avg_logprob > greedy.segments[0].avg_logprob
+    assert beam.windows[0].attempts[0]["beam_size"] == 3
+
+
+def test_beam_search_only_at_temperature_zero():
+    loop = [ts(0)] + [0] * 60 + [ts(5.0), EOT]
+    good = [ts(0), 2, 3, ts(5.0), EOT]
+    t = make([[loop, good]])
+    result = t.transcribe(np.zeros(16000 * 6, dtype=np.float32), "en",
+                          options=DecodingOptions(temperature_fallback=True, beam_size=2))
+    assert [a["beam_size"] for a in result.windows[0].attempts] == [2, 1]  # the fallback samples, as openai/whisper
+
+
+# ----------------------------------------------------------------- carried text
+
+def test_a_window_that_loops_is_not_carried_into_the_next():
+    loop = [ts(0)] + [0] * 60 + [ts(29.0), EOT]
+    second = [ts(0), 2, ts(3.0), EOT]
+    options = DecodingOptions(condition_on_previous_text=True)
+    t = make([loop, second])
+    result = t.transcribe(np.zeros(16000 * 40, dtype=np.float32), "en", options=options)
+    assert t.decoder.prompts[1] == [SOT, EN, TRANSCRIBE]  # started afresh
+    assert result.windows[0].prompt_reset and not result.windows[1].prompt_reset
+
+    t = make([loop, second])
+    t.transcribe(np.zeros(16000 * 40, dtype=np.float32), "en",
+                 options=DecodingOptions(condition_on_previous_text=True, reset_on_loop=False))
+    assert t.decoder.prompts[1][:3] == [PREV, 0, 0]  # the loop is carried over

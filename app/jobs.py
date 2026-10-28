@@ -14,11 +14,12 @@ from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 
-from app.asr import DecodingOptions, Transcriber, transcribe_intervals
+from app.asr import DecodingOptions, Transcriber
 from app.audio import InvalidAudioError, decode_audio, duration_seconds
 from app.metrics import peak_memory_mb
 from app.models import ModelSet
 from app.schemas import InferenceMetrics, Job, JobStatus, Transcript, TranscriptSegment, WindowTrace, utcnow
+from app.vad import SileroVad, transcribe_with
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +35,10 @@ class JobNotFound(KeyError):
 class TranscriptionService:
     def __init__(self, transcriber: Transcriber | None, upload_dir: str, transcriber_error: str | None = None,
                  max_audio_seconds: int = 1800, concurrency: int = 1, max_queue_size: int = 20,
-                 max_finished_jobs: int = 200, models: ModelSet | None = None):
+                 max_finished_jobs: int = 200, models: ModelSet | None = None, vad: SileroVad | None = None):
         self.transcriber = transcriber
+        self.vad = vad  # voice activity detection, for jobs that ask for it
+        self.vad_error: str | None = None  # why it isn't there
         # The models a job can choose; by default only the service's own.
         self.models = models or ModelSet(transcriber, None, None, None)
         self.transcriber_error = transcriber_error
@@ -183,18 +186,18 @@ class TranscriptionService:
 
             options = DecodingOptions(temperature_fallback=job.temperature_fallback,
                                       condition_on_previous_text=job.condition_on_previous_text,
-                                      initial_prompt=job.initial_prompt)
+                                      initial_prompt=job.initial_prompt, beam_size=job.beam_size,
+                                      reset_on_loop=job.reset_on_loop, vad=job.vad, vad_threshold=job.vad_threshold,
+                                      vad_min_silence_ms=job.vad_min_silence_ms)
             def loading(model_id: str) -> None:
                 job.stage = f"loading {model_id}"
 
             # The service's model, or the one the job asked for, loaded for it and released after it.
             with self.models.use(job.requested_model, on_load=loading) as transcriber:
                 job.stage = "transcribing"
-                if job.intervals:  # one segment per requested span, nothing carried between them
-                    def run(audio, language, on_progress, options, _t=transcriber):
-                        return transcribe_intervals(_t, audio, job.intervals, language, on_progress, options)
-                else:
-                    run = transcriber.transcribe
+                # Only the speech (VAD), and one segment per requested interval, when the job asks for them.
+                def run(audio, language, on_progress, options, _t=transcriber):
+                    return transcribe_with(_t, audio, language, on_progress, options, self.vad, job.intervals)
                 t_load = time.perf_counter()  # inference is timed from here: loading isn't inference
                 job.model = transcriber.name
                 switch = getattr(transcriber, "precision_for", None)  # absent on test fakes
@@ -222,8 +225,10 @@ class TranscriptionService:
                                         no_speech_prob=getattr(s, "no_speech_prob", None))
                       for i, s in enumerate(result.segments)],
             windows=[WindowTrace(start=w.start, length=w.length, consumed=w.consumed, no_speech_prob=w.no_speech_prob,
-                                 skipped=w.skipped, segments=w.segments, attempts=w.attempts)
+                                 skipped=w.skipped, segments=w.segments, attempts=w.attempts,
+                                 prompt_reset=getattr(w, "prompt_reset", False))
                      for w in getattr(result, "windows", None) or []],
+            speech=getattr(result, "speech", None),
         )
         job.metrics = InferenceMetrics(
             audio_seconds=round(seconds, 2),

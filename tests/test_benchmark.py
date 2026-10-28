@@ -123,7 +123,8 @@ def test_models_and_variants(bench):
         {"id": "whisper-tiny", "name": "fake-whisper", "default": True},
         {"id": "whisper-base", "name": "openai/whisper-base", "default": False},
     ]
-    assert [v["id"] for v in bench.get("/benchmark/variants").json()] == ["greedy", "fallback", "fallback_previous"]
+    assert [v["id"] for v in bench.get("/benchmark/variants").json()] == ["greedy", "fallback", "fallback_previous",
+                                                                    "beam5", "vad", "vad_beam5_fallback"]
 
 
 def test_benchmark_run_scores_models_and_variants(bench, transcriber, settings):
