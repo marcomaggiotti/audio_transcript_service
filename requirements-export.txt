@@ -7,3 +7,8 @@ optimum-onnx[onnxruntime]==0.1.0
 transformers>=4.44,<4.58
 # Lets the exporter deduplicate tied weights (whisper-tiny decoder: 198 MB -> 118 MB).
 accelerate>=1.0
+# INT4 copies (onnxruntime's MatMulNBits quantizer needs onnx-ir) and the CTranslate2 conversion (--ct2).
+onnx-ir==1.0.0
+ctranslate2==4.8.3
+# The runtime's version, so the quantized graphs are made by the ONNX Runtime that loads them.
+onnxruntime==1.29.0

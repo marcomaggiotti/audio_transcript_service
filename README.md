@@ -215,6 +215,27 @@ never in memory together. Measured on whisper-tiny, one thread, low-memory mode,
 `GET /config` lists what the export has (`model.available_precisions`). `--no-variants` on the export keeps
 only the default pair (about 120 MB smaller image; jobs can't choose).
 
+**INT4.** The export also keeps 4-bit copies of both parts (`encoder_model.int4.onnx`,
+`decoder_model_merged.int4.onnx`): every MatMul with a constant weight becomes ONNX Runtime's `MatMulNBits`, weights
+in blocks of 32 with a scale each, activations still fp32: about a quarter of the fp32 files, for memory-constrained
+devices. `encoder=int4` and `decoder=int4` pick them (`--no-int4` on the export skips them). Expect more word errors
+than int8: compare them on your audio (Aipollo's Benchmark tab, Testbench).
+
+### Engine per job: ONNX Runtime or CTranslate2
+
+The same checkpoint is also converted for CTranslate2 at build time (`--ct2` on the export: `models/whisper/ct2`,
+float16 weights; the `CTRANSLATE2=false` build arg skips it). `POST /jobs` and `POST /transcribe` take
+`engine=ctranslate2` and `compute_type=int8|int8_float32|float32` (default `int8`, CTranslate2's usual CPU choice):
+the job runs on [faster-whisper](https://github.com/SYSTRAN/faster-whisper) with its own windowing, beam search,
+temperature fallback and VAD (its bundled Silero), from the job's decoding options. The model is loaded for the job
+and released after it, like another model; CTranslate2 runs the service's own model only (`model` is refused), takes
+`compute_type` instead of `encoder`/`decoder`, and is checked against the memory left first. `GET /config` reports
+both engines (`engines.onnx`, `engines.ctranslate2`: available, error, compute types, size).
+
+Every job's metrics now say which engine ran (`metrics.engine`), the size of the weights it ran with
+(`metrics.model_mb`: the files of the precisions used), and its own peak memory (`metrics.peak_memory_mb`: the peak
+is reset when the job starts, on Linux), so jobs can be compared one by one.
+
 ### Model per job
 
 Besides its own model (`WHISPER_MODEL`, loaded at start), the image can hold more (`EXTRA_MODELS`, e.g.

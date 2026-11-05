@@ -26,6 +26,8 @@ class Settings(BaseModel):
     default_language: str = _env("DEFAULT_LANGUAGE", "auto")
     max_new_tokens: int = int(_env("MAX_NEW_TOKENS", "224"))
     onnx_threads: int = int(_env("ONNX_THREADS", "0"))  # 0 = let ONNX Runtime decide
+    # The CTranslate2 conversion of the same model (export --ct2), for jobs with engine=ctranslate2.
+    ct2_model_dir: str = _env("CT2_MODEL_DIR", "")
     # Skip ONNX Runtime's pre-packed weight copies: ~25 MB less RAM, decoder steps ~2x slower.
     whisper_low_memory: bool = _flag("WHISPER_LOW_MEMORY")
     # Decoding defaults (a request can override them): openai/whisper's temperature fallback, and

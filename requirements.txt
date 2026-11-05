@@ -6,3 +6,9 @@ pydantic==2.13.5
 numpy==2.5.3
 onnxruntime==1.29.0
 tokenizers==0.23.3
+# engine=ctranslate2: the same model on CTranslate2 (imported only by those jobs). faster-whisper reads audio with
+# PyAV and models with huggingface-hub; both pinned to the versions tested.
+ctranslate2==4.8.3
+faster-whisper==1.2.1
+av==19.0.1
+huggingface-hub==1.33.0

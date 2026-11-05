@@ -38,8 +38,11 @@ class InferenceMetrics(BaseModel):
     decode_seconds: float
     inference_seconds: float
     real_time_factor: float = Field(description="Inference time / audio length; below 1 is faster than real time")
-    peak_memory_mb: float
+    peak_memory_mb: float = Field(description="Peak resident memory of the service during this job (Linux; elsewhere "
+                                               "since it started)")
     load_seconds: float | None = Field(None, description="Loading the requested model, when it isn't the service's")
+    engine: str = Field("onnx", description="The inference engine that ran: onnx or ctranslate2")
+    model_mb: float | None = Field(None, description="Size of the weights it ran with (the files of the precisions used)")
 
 
 class WindowAttempt(BaseModel):
@@ -84,8 +87,10 @@ class Job(BaseModel):
     temperature_fallback: bool = Field(False, description="Re-decode windows whose text repeats or is unsure")
     condition_on_previous_text: bool = Field(False, description="Prompt each window with the text before it")
     initial_prompt: str | None = Field(None, description="Vocabulary or style hint given to every window")
-    encoder_precision: str | None = Field(None, description="Requested encoder precision (fp32, int8); None = default")
-    decoder_precision: str | None = Field(None, description="Requested decoder precision (fp32, int8); None = default")
+    encoder_precision: str | None = Field(None, description="Requested encoder precision (fp32, int8, int4); None = default")
+    decoder_precision: str | None = Field(None, description="Requested decoder precision (fp32, int8, int4); None = default")
+    engine: str = Field("onnx", description="onnx (ONNX Runtime) or ctranslate2 (CTranslate2 through faster-whisper)")
+    compute_type: str | None = Field(None, description="CTranslate2: int8, int8_float32 or float32; None = int8")
     requested_model: str | None = Field(None, description="Requested model (e.g. openai/whisper-small); None = the service's")
     beam_size: int = Field(1, description="Candidate texts kept at temperature 0 (1 = greedy)")
     reset_on_loop: bool = Field(True, description="Don't prompt the next window with one whose text loops")

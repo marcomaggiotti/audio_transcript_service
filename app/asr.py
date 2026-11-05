@@ -212,7 +212,7 @@ class ModelLoadError(RuntimeError):
     pass
 
 
-PRECISIONS = ("fp32", "int8")
+PRECISIONS = ("fp32", "int8", "int4")
 
 
 def _release_memory() -> None:
@@ -228,13 +228,16 @@ def _release_memory() -> None:
 
 
 def onnx_precision(path: Path) -> str:
-    """'int8' if the graph was dynamically quantized (scripts/export_whisper_onnx.py), else 'fp32'.
+    """'int4' if its weights were quantized to 4 bits (MatMulNBits), 'int8' if the graph was dynamically quantized
+    (scripts/export_whisper_onnx.py), else 'fp32'.
 
     Op types are stored as plain strings in the protobuf, so this needs no onnx package and no full parse.
     """
     import mmap
 
     with path.open("rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+        if data.find(b"MatMulNBits") >= 0:
+            return "int4"
         return "int8" if data.find(b"DynamicQuantizeLinear") >= 0 or data.find(b"MatMulInteger") >= 0 else "fp32"
 
 
@@ -378,6 +381,18 @@ class OnnxWhisperTranscriber:
             transcriber.variants[part] = files
         transcriber._load_session = lambda file: ort.InferenceSession(str(file), options, providers=providers)
         return transcriber
+
+    def weights_mb(self, used: dict[str, str] | None = None) -> float | None:
+        """The size of the weights a job ran with: the encoder and decoder files of the precisions used (with their
+        external data, if any). None when the files aren't known."""
+        used = used or self.precision or {}
+        try:
+            files = [self.variants[part][used[part]] for part in ("encoder", "decoder")]
+        except KeyError:
+            return None
+        sizes = [f.stat().st_size + (f.with_name(f.name + "_data").stat().st_size if f.with_name(f.name + "_data").exists() else 0)
+                 for f in files if f.exists()]
+        return round(sum(sizes) / 1e6, 1) if len(sizes) == 2 else None
 
     @property
     def available_precisions(self) -> dict[str, list[str]]:
