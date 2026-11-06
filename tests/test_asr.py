@@ -123,7 +123,9 @@ def test_language_detection():
 def test_english_only_model_uses_short_prompt():
     t = make([[ts(0), 0, ts(1.0), EOT]], multilingual=False)
     assert t._prompt("de") == [SOT]
-    assert t.transcribe(np.zeros(16000, dtype=np.float32)).segments[0].text == "hello"
+    result = t.transcribe(np.zeros(16000, dtype=np.float32))
+    assert result.segments[0].text == "hello"
+    assert result.language == "en"  # reported even though nothing was detected
 
 
 def test_unknown_language_rejected():
@@ -244,3 +246,19 @@ def test_precision_swaps_parts_for_one_job_and_back(tmp_path):
     with pytest.raises(ValueError, match="encoder precision fp16 isn't available"):
         with t.precision_for("fp16", None):
             pass
+
+
+def test_english_only_config_wins_over_language_tokens():
+    class Tokenizer:  # an .en tokenizer still has the language tokens
+        ids = {"<|endoftext|>": 50256, "<|startoftranscript|>": 50257, "<|en|>": 50258, "<|it|>": 50274,
+               "<|transcribe|>": 50358, "<|startofprev|>": 50360, "<|nocaptions|>": 50361}
+
+        def token_to_id(self, token):
+            return self.ids.get(token)
+
+    from app.asr import _resolve_tokens
+    english = _resolve_tokens(Tokenizer(), {"is_multilingual": False, "no_timestamps_token_id": 50362,
+                                            "lang_to_id": {"<|en|>": 50258}})
+    assert not english.multilingual and english.timestamp_begin == 50363 and english.no_speech == 50361
+    multilingual = _resolve_tokens(Tokenizer(), {"no_timestamps_token_id": 50362})
+    assert multilingual.lang_to_id == {"en": 50258, "it": 50274}

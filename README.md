@@ -10,6 +10,10 @@ The speech-recognition code is taken from
 export, NumPy log-mel features, greedy decoding with Whisper's timestamp rules, audio decoding).
 This service keeps only that part. It has no search or embeddings.
 
+The default model is **`openai/whisper-tiny.en`**: English only, and more accurate on English than the
+multilingual `openai/whisper-tiny` of the same size. For other languages, pick `whisper-small` per job
+(`model=`, shipped through `EXTRA_MODELS`) or make `openai/whisper-tiny` the default (`WHISPER_MODEL`).
+
 ```
  POST /transcribe ─────────────► queue ─► ffmpeg decode → 16 kHz mono
  POST /jobs  (202 + job id)              log-mel spectrogram (NumPy)
@@ -50,8 +54,8 @@ This service keeps only that part. It has no search or embeddings.
 # Plain text, waiting for the result
 curl -F file=@episode.mp3 "localhost:8000/transcribe?format=text"
 
-# Subtitles in Italian
-curl -F file=@clip.m4a -F language=it "localhost:8000/transcribe?format=srt" -o clip.srt
+# Subtitles in Italian: the default whisper-tiny.en only does English, so pick a multilingual model
+curl -F file=@clip.m4a -F language=it -F model=openai/whisper-small "localhost:8000/transcribe?format=srt" -o clip.srt
 
 # Long file: queue it, poll, fetch
 curl -F file=@talk.mp3 localhost:8000/jobs               # {"id": "…", "status": "queued", …}
@@ -70,7 +74,7 @@ The JSON transcript looks like this:
     {"index": 0, "start": 0.0, "end": 4.2, "text": "Welcome to the show.",
      "avg_logprob": -0.21, "no_speech_prob": 0.01}
   ],
-  "model": "openai/whisper-tiny",
+  "model": "openai/whisper-tiny.en",
   "metrics": {"audio_seconds": 15.0, "decode_seconds": 0.05, "inference_seconds": 2.1,
               "real_time_factor": 0.14, "peak_memory_mb": 310.0}
 }
@@ -124,8 +128,8 @@ punctuation and bracketed notes like `[music]`.
 Export the candidates next to each other:
 
 ```bash
-python scripts/export_whisper_onnx.py --model openai/whisper-tiny --output models/whisper-tiny
-python scripts/export_whisper_onnx.py --model openai/whisper-base --output models/whisper-base
+python scripts/export_whisper_onnx.py --model openai/whisper-tiny.en --output models/whisper-tiny.en
+python scripts/export_whisper_onnx.py --model openai/whisper-base.en --output models/whisper-base.en
 ```
 
 The service's own model stays loaded; another model is loaded for its part of a run and freed
@@ -138,8 +142,8 @@ afterwards, so a run needs room for both (whisper-base with tiny: about +150 MB)
 references, including the Benchmark tab's `clips/` folder:
 
 ```bash
-python scripts/wer.py data/benchmark/clips --model-dir models/whisper-tiny --model-dir models/whisper-base \
-    --language it --details
+python scripts/wer.py data/benchmark/clips --model-dir models/whisper-tiny.en --model-dir models/whisper-base.en \
+    --language en --details
 ```
 
 | Method | Path | Purpose |
@@ -197,6 +201,7 @@ lists the models (`models`: precisions, languages, `needs_mb`, `fits`, `reason`)
 
 | Model | Size | Italian | Memory while transcribing | Render plan |
 |---|---|---|---|---|
+| whisper-tiny.en (default) | 39 M parameters | no: English only | ~300 MB | starter (512 MB) |
 | whisper-tiny | 39 M parameters | usable on clear speech | ~300 MB | starter (512 MB) |
 | whisper-small | 244 M parameters | much better | ~1 GB, next to tiny | standard (2 GB) |
 
@@ -207,9 +212,9 @@ pip install -r requirements-dev.txt
 # Once, to export the model. Needs torch (CPU build is enough):
 pip install --index-url https://download.pytorch.org/whl/cpu torch
 pip install -r requirements-export.txt
-python scripts/export_whisper_onnx.py --model openai/whisper-tiny --output models/whisper-tiny
+python scripts/export_whisper_onnx.py --model openai/whisper-tiny.en --output models/whisper-tiny.en
 
-WHISPER_MODEL_DIR=models/whisper-tiny python main.py
+WHISPER_MODEL_DIR=models/whisper-tiny.en python main.py
 open http://localhost:8000          # web page; API docs at /docs
 ```
 
@@ -217,8 +222,10 @@ open http://localhost:8000          # web page; API docs at /docs
 Without a model directory the service still starts in `degraded` mode: `/health` says why, and
 transcription requests get `503`.
 
-Any Whisper checkpoint on Hugging Face works: `openai/whisper-base`, `openai/whisper-small`, or an
-English-only `openai/whisper-tiny.en`. Larger models are more accurate but slower and use more RAM.
+Any Whisper checkpoint on Hugging Face works: the multilingual `openai/whisper-tiny`, `openai/whisper-base`
+or `openai/whisper-small`, or the English-only `openai/whisper-base.en`. Larger models are more accurate but
+slower and use more RAM. An English-only model ignores `language` and reports `en`; asking it for another
+language gets `422`.
 
 Tests use a fake Whisper, so they need no model download:
 
@@ -230,7 +237,8 @@ pytest
 
 | Variable | Default | Notes |
 |---|---|---|
-| `WHISPER_MODEL_DIR` | `./models/whisper-tiny` | Output of `scripts/export_whisper_onnx.py` |
+| `WHISPER_MODEL_DIR` | `./models/whisper-tiny.en` | Output of `scripts/export_whisper_onnx.py` |
+| `WHISPER_MODEL` | `openai/whisper-tiny.en` | Build arg (Docker, Render): the model exported as the service's own |
 | `DEFAULT_LANGUAGE` | `auto` | Used when a request doesn't specify one; `auto` detects it |
 | `MAX_NEW_TOKENS` | `224` | Decoder tokens per 30 s window |
 | `ONNX_THREADS` | `0` (auto) | ONNX Runtime threads; set to the instance's CPU count |
@@ -251,7 +259,8 @@ pytest
 ## Docker and Render
 
 ```bash
-docker build -t audio-transcript --build-arg WHISPER_MODEL=openai/whisper-tiny .
+docker build -t audio-transcript .                    # whisper-tiny.en
+docker build -t audio-transcript --build-arg WHISPER_MODEL=openai/whisper-tiny .   # multilingual
 docker run -p 10000:10000 -e API_TOKEN=secret audio-transcript
 ```
 

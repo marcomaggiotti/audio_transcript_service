@@ -1,7 +1,8 @@
 # Stage 1: export Whisper to ONNX (needs torch; discarded afterwards).
 # On Render, the WHISPER_MODEL environment variable is passed in as this build arg.
+# Default: whisper-tiny.en, English only; openai/whisper-tiny is the same size and multilingual.
 FROM python:3.12-slim AS export
-ARG WHISPER_MODEL=openai/whisper-tiny
+ARG WHISPER_MODEL=openai/whisper-tiny.en
 # More models a job can choose (POST /jobs model=...), space-separated, e.g. "openai/whisper-small". Only their
 # recommended precision pair is exported (encoder fp32, decoder int8), to keep the image smaller.
 ARG EXTRA_MODELS=""

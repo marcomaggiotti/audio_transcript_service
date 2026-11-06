@@ -21,7 +21,7 @@ class Settings(BaseModel):
     port: int = int(_env("PORT", "8000"))
 
     # Speech recognition (Whisper exported to ONNX, see scripts/export_whisper_onnx.py)
-    whisper_model_dir: str = _env("WHISPER_MODEL_DIR", "./models/whisper-tiny")
+    whisper_model_dir: str = _env("WHISPER_MODEL_DIR", "./models/whisper-tiny.en")
     # Used when a request doesn't specify one; "auto" detects the language from the first window.
     default_language: str = _env("DEFAULT_LANGUAGE", "auto")
     max_new_tokens: int = int(_env("MAX_NEW_TOKENS", "224"))

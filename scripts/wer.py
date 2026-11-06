@@ -1,6 +1,6 @@
 """Word error rate of Whisper models and decoding options on reference clips.
 
-    python scripts/wer.py data/benchmark/clips --model-dir models/whisper-tiny --model-dir models/whisper-base \
+    python scripts/wer.py data/benchmark/clips --model-dir models/whisper-tiny.en --model-dir models/whisper-base \
         --variant greedy --variant fallback_previous --language it
 
 CLIPS is a folder of audio files, each with a same-name .txt holding its correct transcript
