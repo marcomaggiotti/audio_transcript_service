@@ -68,6 +68,7 @@ def settings(tmp_path):
         max_upload_mb=1,
         max_audio_seconds=60,
         api_token=None,  # independent of an API_TOKEN exported in the developer's shell
+        vad_model_path=str(tmp_path / "no-vad.onnx"),  # tests that need VAD pass a fake
     )
 
 

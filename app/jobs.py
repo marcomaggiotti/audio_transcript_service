@@ -16,9 +16,11 @@ from pathlib import Path
 
 from app.asr import DecodingOptions, Transcriber
 from app.audio import InvalidAudioError, decode_audio, duration_seconds
-from app.metrics import peak_memory_mb
+from app.ct2 import CT2Engine
+from app.metrics import peak_memory_mb, reset_peak_memory
 from app.models import ModelSet
-from app.schemas import InferenceMetrics, Job, JobStatus, Transcript, TranscriptSegment, utcnow
+from app.schemas import InferenceMetrics, Job, JobStatus, Transcript, TranscriptSegment, WindowTrace, utcnow
+from app.vad import SileroVad, transcribe_with
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +36,12 @@ class JobNotFound(KeyError):
 class TranscriptionService:
     def __init__(self, transcriber: Transcriber | None, upload_dir: str, transcriber_error: str | None = None,
                  max_audio_seconds: int = 1800, concurrency: int = 1, max_queue_size: int = 20,
-                 max_finished_jobs: int = 200, models: ModelSet | None = None):
+                 max_finished_jobs: int = 200, models: ModelSet | None = None, vad: SileroVad | None = None,
+                 ct2: CT2Engine | None = None):
         self.transcriber = transcriber
+        self.ct2 = ct2  # the same model on CTranslate2, for jobs with engine=ctranslate2
+        self.vad = vad  # voice activity detection, for jobs that ask for it
+        self.vad_error: str | None = None  # why it isn't there
         # The models a job can choose; by default only the service's own.
         self.models = models or ModelSet(transcriber, None, None, None)
         self.transcriber_error = transcriber_error
@@ -165,6 +171,7 @@ class TranscriptionService:
             return  # deleted while queued
         job.status, job.started_at, job.stage = JobStatus.processing, utcnow(), "decoding"
         path = self.upload_path(job_id)
+        reset_peak_memory()  # the peak reported is this job's (Linux), not the largest one so far
         try:
             if self.transcriber is None:
                 raise RuntimeError(f"Speech model unavailable: {self.transcriber_error or 'not loaded'}")
@@ -183,25 +190,24 @@ class TranscriptionService:
 
             options = DecodingOptions(temperature_fallback=job.temperature_fallback,
                                       condition_on_previous_text=job.condition_on_previous_text,
-                                      initial_prompt=job.initial_prompt)
+                                      initial_prompt=job.initial_prompt, beam_size=job.beam_size,
+                                      reset_on_loop=job.reset_on_loop, vad=job.vad, vad_threshold=job.vad_threshold,
+                                      vad_min_silence_ms=job.vad_min_silence_ms)
             def loading(model_id: str) -> None:
                 job.stage = f"loading {model_id}"
 
-            # The service's model, or the one the job asked for, loaded for it and released after it.
-            with self.models.use(job.requested_model, on_load=loading) as transcriber:
-                job.stage = "transcribing"
+            if job.engine == "ctranslate2":  # the same model on CTranslate2, loaded for the job and released after
+                if self.ct2 is None:
+                    raise RuntimeError("CTranslate2 is unavailable on this service")
+                job.stage = f"loading {self.ct2.name} on CTranslate2"
+                loaded = [self.ct2.load(job.compute_type)]
                 t_load = time.perf_counter()  # inference is timed from here: loading isn't inference
-                job.model = transcriber.name
-                switch = getattr(transcriber, "precision_for", None)  # absent on test fakes
-                if switch is None:
-                    job.precision = getattr(transcriber, "precision", None)
-                    result = transcriber.transcribe(audio, language=job.language, on_progress=progress,
-                                                    options=options)
-                else:
-                    with switch(job.encoder_precision, job.decoder_precision) as used:
-                        job.precision = used
-                        result = transcriber.transcribe(audio, language=job.language, on_progress=progress,
-                                                        options=options)
+                job.stage, job.model = "transcribing", self.ct2.name
+                job.precision = {"encoder": job.compute_type or "int8", "decoder": job.compute_type or "int8"}
+                weights_mb = self.ct2.size_mb()
+                result = self.ct2.transcribe(loaded.pop(), audio, job.language, options, progress)
+            else:
+                result, t_load, weights_mb = self._onnx(job, audio, options, progress, loading)
             t2 = time.perf_counter()
         except Exception as e:
             logger.exception("Transcription failed for %s", job_id)
@@ -209,7 +215,32 @@ class TranscriptionService:
             job.status, job.finished_at, job.stage = JobStatus.failed, utcnow(), None
             path.unlink(missing_ok=True)
             return
+        self._finish(job, result, seconds, t0, t1, t_load, t2, weights_mb)
 
+    def _onnx(self, job: Job, audio, options: DecodingOptions, progress, loading):
+        """ONNX Runtime: the service's model, or the one the job asked for, in the precisions asked for. Returns the
+        result, when inference started (after any loading) and the size of the weights it ran with."""
+        # The service's model, or the one the job asked for, loaded for it and released after it.
+        with self.models.use(job.requested_model, on_load=loading) as transcriber:
+            job.stage = "transcribing"
+            # Only the speech (VAD), and one segment per requested interval, when the job asks for them.
+            def run(audio, language, on_progress, options, _t=transcriber):
+                return transcribe_with(_t, audio, language, on_progress, options, self.vad, job.intervals)
+            t_load = time.perf_counter()  # inference is timed from here: loading isn't inference
+            job.model = transcriber.name
+            switch = getattr(transcriber, "precision_for", None)  # absent on test fakes
+            if switch is None:
+                job.precision = getattr(transcriber, "precision", None)
+                result = run(audio, language=job.language, on_progress=progress, options=options)
+            else:
+                with switch(job.encoder_precision, job.decoder_precision) as used:
+                    job.precision = used
+                    result = run(audio, language=job.language, on_progress=progress, options=options)
+            weights = getattr(transcriber, "weights_mb", lambda used: None)(job.precision)
+        return result, t_load, weights
+
+    def _finish(self, job: Job, result, seconds: float, t0: float, t1: float, t_load: float, t2: float,
+                weights_mb: float | None) -> None:
         job.transcript = Transcript(
             language=result.language or job.language,
             duration_seconds=round(seconds, 2),
@@ -218,6 +249,11 @@ class TranscriptionService:
                                         avg_logprob=getattr(s, "avg_logprob", None),
                                         no_speech_prob=getattr(s, "no_speech_prob", None))
                       for i, s in enumerate(result.segments)],
+            windows=[WindowTrace(start=w.start, length=w.length, consumed=w.consumed, no_speech_prob=w.no_speech_prob,
+                                 skipped=w.skipped, segments=w.segments, attempts=w.attempts,
+                                 prompt_reset=getattr(w, "prompt_reset", False))
+                     for w in getattr(result, "windows", None) or []],
+            speech=getattr(result, "speech", None),
         )
         job.metrics = InferenceMetrics(
             audio_seconds=round(seconds, 2),
@@ -226,8 +262,9 @@ class TranscriptionService:
             real_time_factor=round((t2 - t_load) / seconds, 3) if seconds else 0.0,
             load_seconds=round(t_load - t1, 3) if t_load - t1 >= 0.01 else None,
             peak_memory_mb=peak_memory_mb(),
+            engine=job.engine, model_mb=weights_mb,
         )
         # Status last, so a reader that sees "completed" also sees the transcript.
         job.progress, job.stage = 1.0, None
         job.status, job.finished_at = JobStatus.completed, utcnow()
-        logger.info("Transcribed %s with %s: %.1fs audio in %.2fs", job_id, job.model, seconds, t2 - t_load)
+        logger.info("Transcribed %s with %s (%s): %.1fs audio in %.2fs", job.id, job.model, job.engine, seconds, t2 - t_load)

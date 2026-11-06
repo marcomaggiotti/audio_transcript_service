@@ -220,3 +220,24 @@ def test_precision_must_be_in_the_export(client):
     res = upload(client, data={"encoder": "int8"})
     assert res.status_code == 422 and "encoder precision int8 isn't available" in res.json()["detail"]
     assert upload(client, data={"decoder": "fp16"}).status_code == 422  # not a precision at all
+
+
+def test_transcribe_on_given_intervals(client, transcriber):
+    """One segment per requested span, at the span's times, transcribed on its own without the previous text."""
+    response = upload(client, "/transcribe", content=make_wav(3.0),
+                      data={"language": "en", "condition_on_previous_text": "true",
+                            "intervals": "[[0, 1.2], [1.2, 2.5], [2.5, 2.55]]"})
+    assert response.status_code == 200
+    body = response.json()
+    assert [(s["start"], s["end"]) for s in body["segments"]] == [(0.0, 1.2), (1.2, 2.5), (2.5, 2.55)]
+    assert body["segments"][0]["text"].startswith("Welcome to the show")  # the fake's three lines, joined
+    assert body["segments"][2]["text"] == ""  # too short to decode: kept, so rows still line up
+    assert transcriber.calls == 2
+    assert all(o.condition_on_previous_text is False for o in transcriber.options)
+
+
+@pytest.mark.parametrize("intervals", ["not json", "[]", "[[1, 0.5]]", "[[0, 2], [1, 3]]", "[[0, \"a\"]]", "[1, 2]"])
+def test_bad_intervals_are_refused(client, transcriber, intervals):
+    response = upload(client, data={"intervals": intervals})
+    assert response.status_code == 422
+    assert transcriber.calls == 0

@@ -19,8 +19,10 @@ Pipeline (each step keeps the graphs runnable on the runtime's onnxruntime):
      encoder int8 7.1%, and the voice note "Take a bottle of milk and kilogram of flour." became
      "Thank you. A little bit of milk and I'll take you to the flower.".
   5. Merge decoder + decoder_with_past into decoder_model_merged.onnx (shared weights, If node).
-  With --variants (the default) the other precision of each part is kept too, as encoder_model.<p>.onnx and
-  decoder_model_merged.<p>.onnx, so a job can ask for it (POST /jobs encoder_precision / decoder_precision).
+  With --variants (the default) the other precisions of each part are kept too, as encoder_model.<p>.onnx and
+  decoder_model_merged.<p>.onnx, so a job can ask for them (POST /jobs encoder_precision / decoder_precision):
+  fp32, int8, and int4 (4-bit weights in blocks of 32, MatMulNBits: about a quarter of the fp32 size; --no-int4).
+  6. With --ct2, the same checkpoint converted for CTranslate2 into OUTPUT/ct2 (POST /jobs engine=ctranslate2).
   --quantize all also quantizes the encoder (smallest, worse transcripts); --quantize none (or --fp32) skips
   step 4 (about +90 MB of RAM for tiny, a little more accurate).
 """
@@ -32,9 +34,10 @@ import sys
 from pathlib import Path
 
 KEEP = {"encoder_model.onnx", "decoder_model_merged.onnx",  # the defaults the service loads
-        # the other precision of each part, loaded only by jobs that ask for it (--variants)
-        "encoder_model.fp32.onnx", "encoder_model.int8.onnx",
-        "decoder_model_merged.fp32.onnx", "decoder_model_merged.int8.onnx"}
+        # the other precisions of each part, loaded only by jobs that ask for them (--variants)
+        "encoder_model.fp32.onnx", "encoder_model.int8.onnx", "encoder_model.int4.onnx",
+        "decoder_model_merged.fp32.onnx", "decoder_model_merged.int8.onnx", "decoder_model_merged.int4.onnx"}
+INT4_BLOCK = 32  # weights quantized in blocks of 32 along the input dimension, each with its own scale
 
 
 def untie_lm_head(path: Path) -> None:
@@ -151,13 +154,41 @@ def quantize(path: Path) -> None:
     tmp.replace(path)
 
 
-def build_precisions(output: Path, default: dict[str, str], variants: bool) -> None:
+def quantize_int4(path: Path) -> None:
+    """4-bit weights for every MatMul with a constant weight (MatMulNBits, blocks of INT4_BLOCK, symmetric):
+    about a quarter of the fp32 size; activations stay fp32. Embeddings and convolutions are left as they are."""
+    import onnx
+    from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
+
+    model = onnx.load(str(path))
+    quantizer = MatMulNBitsQuantizer(model, bits=4, block_size=INT4_BLOCK, is_symmetric=True)
+    quantizer.process()
+    tmp = path.with_name(path.name + ".quantizing")
+    quantizer.model.save_model_to_file(str(tmp), use_external_data_format=False)
+    tmp.replace(path)
+
+
+def convert_ct2(model: str, output: Path) -> None:
+    """The same checkpoint for CTranslate2 (faster-whisper): float16 weights (converted again to the job's compute
+    type on load), with the tokenizer and preprocessor config faster-whisper reads from the folder."""
+    cmd = ["ct2-transformers-converter", "--model", model, "--output_dir", str(output), "--quantization", "float16",
+           "--copy_files", "tokenizer.json", "preprocessor_config.json", "--force"]
+    print("$", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+    (output / "model_id.txt").write_text(model + "\n")
+
+
+def build_precisions(output: Path, default: dict[str, str], variants: bool, int4: bool = True) -> None:
     """encoder_model.onnx / decoder_model_merged.onnx in the default precision, and with `variants` the other
-    precision as encoder_model.<p>.onnx / decoder_model_merged.<p>.onnx. INT8 graphs are quantized copies."""
+    precisions as encoder_model.<p>.onnx / decoder_model_merged.<p>.onnx. INT8 and INT4 graphs are quantized copies
+    of the fp32 ones (INT4 only with `int4`)."""
     from optimum.onnx.graph_transformations import merge_decoders
 
-    wanted = {part: {"fp32", "int8"} if variants else {default[part]} for part in default}
+    wanted = {part: ({"fp32", "int8"} | ({"int4"} if int4 else set())) if variants else {default[part]} for part in default}
     encoder = output / "encoder_model.onnx"
+    if "int4" in wanted["encoder"]:
+        shutil.copy(encoder, output / "encoder_model.int4.onnx")  # from the fp32 graph, before any default swap
+        quantize_int4(output / "encoder_model.int4.onnx")
     if "int8" in wanted["encoder"]:
         shutil.copy(encoder, output / "encoder_model.int8.onnx")
         quantize(output / "encoder_model.int8.onnx")
@@ -169,14 +200,14 @@ def build_precisions(output: Path, default: dict[str, str], variants: bool) -> N
     decoders = ("decoder_model", "decoder_with_past_model")
     for precision in sorted(wanted["decoder"]):
         names = [f"{d}.onnx" for d in decoders]
-        if precision == "int8":
+        if precision in ("int8", "int4"):
             for d in decoders:
-                shutil.copy(output / f"{d}.onnx", output / f"{d}.int8.onnx")
-                quantize(output / f"{d}.int8.onnx")
-            names = [f"{d}.int8.onnx" for d in decoders]
+                shutil.copy(output / f"{d}.onnx", output / f"{d}.{precision}.onnx")
+                (quantize if precision == "int8" else quantize_int4)(output / f"{d}.{precision}.onnx")
+            names = [f"{d}.{precision}.onnx" for d in decoders]
         target = "decoder_model_merged.onnx" if precision == default["decoder"] else f"decoder_model_merged.{precision}.onnx"
         merge_decoders(output / names[0], output / names[1], save_path=output / target, strict=False)
-        if precision == "int8":
+        if precision in ("int8", "int4"):
             for name in names:
                 (output / name).unlink()
 
@@ -215,6 +246,11 @@ def main() -> int:
     parser.add_argument("--fp32", action="store_true", help="Same as --quantize none")
     parser.add_argument("--no-variants", dest="variants", action="store_false",
                         help="Only the default precision of each part (smaller image; jobs can't choose)")
+    parser.add_argument("--no-int4", dest="int4", action="store_false",
+                        help="With variants, no 4-bit copies (encoder_model.int4.onnx, decoder_model_merged.int4.onnx)")
+    parser.add_argument("--ct2", action="store_true",
+                        help="Also convert the checkpoint for CTranslate2 into OUTPUT/ct2 (needs ctranslate2), for "
+                             "jobs with engine=ctranslate2")
     parser.add_argument("--prune", action="store_true",
                         help="Delete exported graphs the service does not load (smaller Docker image)")
     args = parser.parse_args()
@@ -243,9 +279,9 @@ def main() -> int:
     print(f"fused {fused}/{config['encoder_layers']} encoder attention blocks")
     mode = "none" if args.fp32 else args.quantize
     default = {"encoder": "int8" if mode == "all" else "fp32", "decoder": "fp32" if mode == "none" else "int8"}
-    build_precisions(output, default, args.variants)
+    build_precisions(output, default, args.variants, args.int4)
     print(f"default precision: encoder {default['encoder']}, decoder {default['decoder']}"
-          + (" (both precisions kept)" if args.variants else ""))
+          + ((" (fp32, int8" + (" and int4" if args.int4 else "") + " kept)") if args.variants else ""))
     smoke_test(output)
 
     if args.prune:
@@ -254,6 +290,8 @@ def main() -> int:
                 path.unlink()
                 print(f"pruned {path.name}")
     (output / "model_id.txt").write_text(args.model + "\n")  # reported as the model name by the API
+    if args.ct2:
+        convert_ct2(args.model, output / "ct2")
     size = lambda names: sum(f.stat().st_size for f in output.glob("*.onnx*") if f.name in names) / 1e6  # noqa: E731
     loaded = size({"encoder_model.onnx", "decoder_model_merged.onnx"})
     print(f"Exported {args.model} to {output} ({loaded:.0f} MB of ONNX weights loaded by the API"

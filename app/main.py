@@ -2,6 +2,7 @@
 
 import asyncio
 import hmac
+import json
 import logging
 import shutil
 import uuid
@@ -13,7 +14,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
-from app.asr import OnnxWhisperTranscriber, Transcriber
+from app.asr import MAX_BEAM_SIZE, MAX_INTERVALS, OnnxWhisperTranscriber, Transcriber
 from app.audio import MEDIA_TYPES, InvalidAudioError, decode_audio, detect_format, duration_seconds
 from app.benchmark import (
     VARIANTS,
@@ -26,7 +27,9 @@ from app.benchmark import (
 from app.config import Settings, get_settings
 from app.formats import RENDERERS
 from app.jobs import JobNotFound, QueueFullError, TranscriptionService
-from app.models import ModelSet, ModelUnavailable, memory_limit_mb
+from app.models import HEADROOM, ModelSet, ModelUnavailable, memory_limit_mb
+from app.ct2 import COMPUTE_TYPES, CT2Engine
+from app.vad import MAX_PIECE_SECONDS, SPEECH_PAD_MS, load_vad
 from app.schemas import (
     BenchmarkCreate,
     BenchmarkModel,
@@ -76,6 +79,10 @@ class Components:
     load_model: Callable[[Path], Transcriber] | None = None
     # The container's memory in MB, for the "does this model fit" check (tests set it); default: from cgroups.
     memory_limit_mb: float | None = None
+    # Voice activity detection (tests pass a fake); default: Silero VAD from VAD_MODEL_PATH, if it's there.
+    vad: object | None = None
+    # The model on CTranslate2 (tests pass a fake); default: CT2_MODEL_DIR, or WHISPER_MODEL_DIR/ct2.
+    ct2: object | None = None
 
 
 def _clock(seconds: float) -> str:
@@ -110,14 +117,20 @@ def create_app(settings: Settings | None = None, components: Components | None =
                           components.load_model or load_model,
                           limit_mb=components.memory_limit_mb if components.memory_limit_mb is not None
                           else memory_limit_mb())
+        vad, vad_error = (components.vad, None) if components.vad is not None else load_vad(settings.vad_model_path)
+        if vad_error:
+            logger.warning("Voice activity detection unavailable: %s", vad_error)
         service = TranscriptionService(
             transcriber, settings.upload_dir, transcriber_error,
             max_audio_seconds=settings.max_audio_seconds,
             concurrency=settings.worker_concurrency,
             max_queue_size=settings.max_queue_size,
             max_finished_jobs=settings.max_finished_jobs,
-            models=models,
+            models=models, vad=vad,
+            ct2=components.ct2 or CT2Engine(settings.ct2_model_dir or Path(settings.whisper_model_dir) / "ct2",
+                                            settings.onnx_threads),
         )
+        service.vad_error = vad_error
         app.state.service = service
         await service.start()
 
@@ -126,7 +139,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
         app.state.benchmark = BenchmarkRunner(
             store, service.submit_task,
             (Path(settings.whisper_model_dir).name, transcriber) if transcriber else None,
-            settings.models_dir, components.load_model or load_model,
+            settings.models_dir, components.load_model or load_model, vad=vad,
         )
         app.state.benchmark.recover()
         yield
@@ -180,6 +193,28 @@ def create_app(settings: Settings | None = None, components: Components | None =
                 have = ", ".join(available.get(part) or [default.get(part) or "the default only"])
                 raise HTTPException(422, f"{part} precision {p} isn't available for {info.id} ({have}); see GET /config")
 
+    def check_engine(service: TranscriptionService, engine: str | None, compute_type: str | None, model: str | None,
+                     encoder: str | None, decoder: str | None) -> None:
+        """CTranslate2 needs its conversion of the service's model, and memory to load it next to the ONNX one."""
+        if engine != "ctranslate2":
+            if compute_type:
+                raise HTTPException(422, "compute_type is for engine=ctranslate2; ONNX Runtime takes encoder/decoder")
+            return
+        error = service.ct2.error() if service.ct2 else "not set up"
+        if error:
+            raise HTTPException(503, f"CTranslate2 is unavailable on this service: {error}; see GET /config")
+        if model and service.models.find(model) is not service.models.find(None):
+            raise HTTPException(422, "CTranslate2 runs the service's own model only (its conversion is built with it)")
+        if encoder or decoder:
+            raise HTTPException(422, "With engine=ctranslate2, choose the precision with compute_type "
+                                     f"({', '.join(COMPUTE_TYPES)}), not encoder/decoder")
+        limit = service.models.limit_mb
+        if limit is not None:
+            free = limit * HEADROOM - service.models.rss_mb()
+            if service.ct2.needs_mb() > free:
+                raise HTTPException(422, f"CTranslate2 needs about {service.ct2.needs_mb():.0f} MB and this server has "
+                                         f"about {max(free, 0):.0f} MB free of {limit:.0f} MB")
+
     def check_ready(service: TranscriptionService, language: str | None, model: str | None = None) -> str:
         """Fail early when nothing could be transcribed; return the language to use."""
         if service.transcriber is None:
@@ -215,7 +250,11 @@ def create_app(settings: Settings | None = None, components: Components | None =
     def submit_job(service: TranscriptionService, job_id: str, filename: str, size: int, language: str,
                    temperature_fallback: bool | None = None, condition_on_previous_text: bool | None = None,
                    initial_prompt: str | None = None, encoder: str | None = None,
-                   decoder: str | None = None, model: str | None = None) -> Job:
+                   decoder: str | None = None, model: str | None = None,
+                   intervals: list[tuple[float, float]] | None = None, beam_size: int | None = None,
+                   reset_on_loop: bool | None = None, vad: bool | None = None, vad_threshold: float | None = None,
+                   vad_min_silence_ms: int | None = None, engine: str | None = None,
+                   compute_type: str | None = None) -> Job:
         """Queue the audio at service.upload_path(job_id), with the default decoding options unless given."""
         job = Job(
             id=job_id, filename=filename, size_bytes=size, language=None if language == "auto" else language,
@@ -226,7 +265,17 @@ def create_app(settings: Settings | None = None, components: Components | None =
             initial_prompt=(initial_prompt or settings.initial_prompt or "").strip() or None,
             encoder_precision=encoder, decoder_precision=decoder,
             requested_model=service.models.find(model).id if model else None,
+            intervals=intervals,
+            beam_size=settings.beam_size if beam_size is None else beam_size,
+            reset_on_loop=settings.reset_prompt_on_loop if reset_on_loop is None else reset_on_loop,
+            vad=settings.vad if vad is None else vad,
+            vad_threshold=settings.vad_threshold if vad_threshold is None else vad_threshold,
+            vad_min_silence_ms=settings.vad_min_silence_ms if vad_min_silence_ms is None else vad_min_silence_ms,
+            engine=engine or "onnx", compute_type=compute_type if engine == "ctranslate2" else None,
         )
+        if job.vad and service.vad is None and job.engine == "onnx":  # CTranslate2 has its own (faster-whisper's)
+            raise HTTPException(503, "Voice activity detection is unavailable on this service: "
+                                     f"{service.vad_error or 'not loaded'}; send vad=false")
         try:
             service.submit(job)
         except QueueFullError as e:
@@ -236,11 +285,41 @@ def create_app(settings: Settings | None = None, components: Components | None =
     async def accept_upload(service: TranscriptionService, file: UploadFile, language: str | None,
                             **options) -> Job:
         """Validate and store the upload, then queue it as a job."""
+        options["intervals"] = parse_intervals(options.get("intervals"))
         language = check_ready(service, language, options.get("model"))
-        check_model(service, options.get("model"), language, options.get("encoder"), options.get("decoder"))
+        if options.get("engine") == "ctranslate2":
+            check_engine(service, "ctranslate2", options.get("compute_type"), options.get("model"),
+                         options.get("encoder"), options.get("decoder"))
+            options["model"] = None  # the service's own model, on the other engine
+        else:
+            check_engine(service, options.get("engine"), options.get("compute_type"), None, None, None)
+            check_model(service, options.get("model"), language, options.get("encoder"), options.get("decoder"))
         job_id = uuid.uuid4().hex
         size = await save_upload(file, service.upload_path(job_id))
         return submit_job(service, job_id, file.filename or "audio", size, language, **options)
+
+    def parse_intervals(raw: str | None) -> list[tuple[float, float]] | None:
+        """The `intervals` form field: a JSON list of [start, end] pairs in seconds, in order, not overlapping."""
+        if raw is None or not raw.strip():
+            return None
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            raise HTTPException(422, "intervals must be JSON, e.g. [[0, 12.5], [12.5, 30]]")
+        if not isinstance(value, list) or not value or len(value) > MAX_INTERVALS:
+            raise HTTPException(422, f"intervals must be a list of 1 to {MAX_INTERVALS} [start, end] pairs")
+        out: list[tuple[float, float]] = []
+        for pair in value:
+            if (not isinstance(pair, list) or len(pair) != 2
+                    or not all(isinstance(t, (int, float)) and not isinstance(t, bool) for t in pair)):
+                raise HTTPException(422, "each interval must be [start, end] in seconds")
+            start, end = float(pair[0]), float(pair[1])
+            if start < 0 or end <= start:
+                raise HTTPException(422, f"interval [{start}, {end}] must have 0 <= start < end")
+            if out and start < out[-1][1] - 0.01:
+                raise HTTPException(422, "intervals must be in order and must not overlap")
+            out.append((start, end))
+        return out
 
     def render(job: Job, fmt: OutputFormat):
         if fmt == OutputFormat.json:
@@ -265,10 +344,31 @@ def create_app(settings: Settings | None = None, components: Components | None =
     previous_param = Form(None, description="Prompt each 30 s window with the text before it "
                                             "(default: CONDITION_ON_PREVIOUS_TEXT)")
     prompt_param = Form(None, max_length=1000, description="Vocabulary or style hint, e.g. names and terms")
-    encoder_param = Form(None, pattern=r"^(fp32|int8)$",
+    encoder_param = Form(None, pattern=r"^(fp32|int8|int4)$",
                          description="Encoder precision: fp32 (full, the default) or int8 (smaller, less accurate)")
-    decoder_param = Form(None, pattern=r"^(fp32|int8)$",
+    decoder_param = Form(None, pattern=r"^(fp32|int8|int4)$",
                          description="Decoder precision: int8 (the default) or fp32 (full)")
+    intervals_param = Form(None, max_length=200_000,
+                           description="JSON [[start, end], ...] in seconds: transcribe each span on its own, with no "
+                                       "text carried between them, and return exactly one segment per span with its "
+                                       "times (empty text where nothing was heard). For transcribing a copy of a "
+                                       "recording on the original's lines")
+    beam_param = Form(None, ge=1, le=MAX_BEAM_SIZE,
+                      description="Beam search: candidate texts kept at temperature 0 (1 = greedy; openai/whisper: 5). "
+                                  "Fewer word errors, decoder about 3-5x slower (default: BEAM_SIZE)")
+    reset_param = Form(None, description="With previous text on: don't prompt the next window with one whose text "
+                                         "loops (default: RESET_PROMPT_ON_LOOP)")
+    vad_param = Form(None, description="Voice activity detection: transcribe only the speech, cut at pauses into "
+                                       "pieces up to 30 s (default: VAD)")
+    vad_threshold_param = Form(None, ge=0.1, le=0.95, description="VAD: speech probability above which a 32 ms frame "
+                                                                  "is speech (default: VAD_THRESHOLD, 0.5)")
+    vad_silence_param = Form(None, ge=100, le=5000, description="VAD: a pause at least this long (ms) ends a stretch "
+                                                                "of speech (default: VAD_MIN_SILENCE_MS, 500)")
+    engine_param = Form(None, pattern=r"^(onnx|ctranslate2)$",
+                        description="Inference engine: onnx (ONNX Runtime, default) or ctranslate2 (the same model on "
+                                    "CTranslate2 through faster-whisper; see GET /config engines)")
+    compute_type_param = Form(None, pattern=r"^(int8|int8_float32|float32)$",
+                              description="With engine=ctranslate2: the weights' type (default int8)")
     model_param = Form(None, max_length=200,
                        description="Model for this job, e.g. openai/whisper-small (see GET /config); default: the "
                                    "service's. Another model is loaded for the job and released after it")
@@ -281,12 +381,20 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          format: OutputFormat = format_param, temperature_fallback: bool | None = fallback_param,
                          condition_on_previous_text: bool | None = previous_param,
                          initial_prompt: str | None = prompt_param, encoder: str | None = encoder_param,
-                         decoder: str | None = decoder_param, model: str | None = model_param):
+                         decoder: str | None = decoder_param, model: str | None = model_param,
+                         intervals: str | None = intervals_param, beam_size: int | None = beam_param,
+                         reset_on_loop: bool | None = reset_param, vad: bool | None = vad_param,
+                         vad_threshold: float | None = vad_threshold_param,
+                         vad_min_silence_ms: int | None = vad_silence_param,
+                         engine: str | None = engine_param, compute_type: str | None = compute_type_param):
         """Upload audio and wait for its transcript. Shares the job queue, so it waits its turn."""
         service = service_of(request)
         job = await accept_upload(service, file, language, temperature_fallback=temperature_fallback,
                                   condition_on_previous_text=condition_on_previous_text,
-                                  initial_prompt=initial_prompt, encoder=encoder, decoder=decoder, model=model)
+                                  initial_prompt=initial_prompt, encoder=encoder, decoder=decoder, model=model,
+                                  intervals=intervals, beam_size=beam_size, reset_on_loop=reset_on_loop, vad=vad,
+                                  vad_threshold=vad_threshold, vad_min_silence_ms=vad_min_silence_ms,
+                                  engine=engine, compute_type=compute_type)
         try:
             job = await service.wait(job.id)
         finally:
@@ -303,14 +411,22 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          temperature_fallback: bool | None = fallback_param,
                          condition_on_previous_text: bool | None = previous_param,
                          initial_prompt: str | None = prompt_param, encoder: str | None = encoder_param,
-                         decoder: str | None = decoder_param, model: str | None = model_param):
+                         decoder: str | None = decoder_param, model: str | None = model_param,
+                         intervals: str | None = intervals_param, beam_size: int | None = beam_param,
+                         reset_on_loop: bool | None = reset_param, vad: bool | None = vad_param,
+                         vad_threshold: float | None = vad_threshold_param,
+                         vad_min_silence_ms: int | None = vad_silence_param,
+                         engine: str | None = engine_param, compute_type: str | None = compute_type_param):
         """Upload audio for background transcription; poll the status URL, then fetch the transcript.
 
         `model` picks the speech model and `encoder` / `decoder` the precision of each part for this job (see
         GET /config for what this deployment has); anything not loaded is loaded for the job and released after."""
         job = await accept_upload(service_of(request), file, language, temperature_fallback=temperature_fallback,
                                   condition_on_previous_text=condition_on_previous_text,
-                                  initial_prompt=initial_prompt, encoder=encoder, decoder=decoder, model=model)
+                                  initial_prompt=initial_prompt, encoder=encoder, decoder=decoder, model=model,
+                                  intervals=intervals, beam_size=beam_size, reset_on_loop=reset_on_loop, vad=vad,
+                                  vad_threshold=vad_threshold, vad_min_silence_ms=vad_min_silence_ms,
+                                  engine=engine, compute_type=compute_type)
         return summary(job)
 
     @app.get("/jobs", response_model=list[JobSummary])
@@ -550,6 +666,9 @@ def create_app(settings: Settings | None = None, components: Components | None =
                       "low_memory": settings.whisper_low_memory,
                       "onnx_threads": settings.onnx_threads, "runtime": "ONNX Runtime (CPU)"},
             "models": [m.view(*service.models.fits(m)) for m in service.models.list()],
+            "engines": {"onnx": {"available": t is not None, "runtime": "ONNX Runtime (CPU)",
+                                 "precisions": list(asr.PRECISIONS)},
+                        "ctranslate2": service.ct2.status() if service.ct2 else {"available": False, "error": "not set up"}},
             "memory_limit_mb": round(service.models.limit_mb) if service.models.limit_mb else None,
             "audio": {"decoder": "ffmpeg (pure-Python fallback for WAV)", "sample_rate": features.SAMPLE_RATE,
                       "channels": 1, "sample_format": "16-bit PCM", "max_audio_seconds": settings.max_audio_seconds,
@@ -568,6 +687,13 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          "logprob_threshold": asr.LOGPROB_THRESHOLD, "no_speech_threshold": asr.NO_SPEECH_THRESHOLD,
                          "condition_on_previous_text": settings.condition_on_previous_text,
                          "initial_prompt": settings.initial_prompt,
+                         "beam_size": settings.beam_size, "max_beam_size": asr.MAX_BEAM_SIZE,
+                         "reset_prompt_on_loop": settings.reset_prompt_on_loop,
+                         "vad": {"default": settings.vad, "available": service.vad is not None,
+                                 "error": service.vad_error, "model": "Silero VAD v5 (ONNX)",
+                                 "threshold": settings.vad_threshold,
+                                 "min_silence_ms": settings.vad_min_silence_ms,
+                                 "speech_pad_ms": SPEECH_PAD_MS, "max_piece_seconds": MAX_PIECE_SECONDS},
                          "timestamp_precision_seconds": asr.TIME_PRECISION},
         }
 

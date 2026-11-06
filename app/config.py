@@ -26,6 +26,8 @@ class Settings(BaseModel):
     default_language: str = _env("DEFAULT_LANGUAGE", "auto")
     max_new_tokens: int = int(_env("MAX_NEW_TOKENS", "224"))
     onnx_threads: int = int(_env("ONNX_THREADS", "0"))  # 0 = let ONNX Runtime decide
+    # The CTranslate2 conversion of the same model (export --ct2), for jobs with engine=ctranslate2.
+    ct2_model_dir: str = _env("CT2_MODEL_DIR", "")
     # Skip ONNX Runtime's pre-packed weight copies: ~25 MB less RAM, decoder steps ~2x slower.
     whisper_low_memory: bool = _flag("WHISPER_LOW_MEMORY")
     # Decoding defaults (a request can override them): openai/whisper's temperature fallback, and
@@ -33,6 +35,15 @@ class Settings(BaseModel):
     temperature_fallback: bool = _flag("TEMPERATURE_FALLBACK", "true")
     condition_on_previous_text: bool = _flag("CONDITION_ON_PREVIOUS_TEXT", "true")
     initial_prompt: str | None = _env("INITIAL_PROMPT")
+    # Beam search at temperature 0 (1 = greedy; openai/whisper uses 5): fewer word errors, decoder ~3-5x slower.
+    beam_size: int = int(_env("BEAM_SIZE", "1"))
+    # Don't prompt the next window with a window whose text loops (only matters with previous text on).
+    reset_prompt_on_loop: bool = _flag("RESET_PROMPT_ON_LOOP", "true")
+    # Voice activity detection (Silero VAD, app/vad.py): transcribe only the speech, cut at pauses.
+    vad: bool = _flag("VAD")
+    vad_model_path: str = _env("VAD_MODEL_PATH", "./models/vad/silero_vad.onnx")
+    vad_threshold: float = float(_env("VAD_THRESHOLD", "0.5"))
+    vad_min_silence_ms: int = int(_env("VAD_MIN_SILENCE_MS", "500"))
 
     # Benchmark tab: every subdirectory of MODELS_DIR holding an export can be compared.
     models_dir: str = _env("MODELS_DIR", "./models")

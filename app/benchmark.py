@@ -40,6 +40,7 @@ from app.schemas import (
     ReferenceClipInfo,
     utcnow,
 )
+from app.vad import transcribe_with
 from app.wer import word_error_rate
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,12 @@ VARIANTS = {
                          condition_on_previous_text=False),
         BenchmarkVariant(id="fallback_previous", label="Fallback + previous text", temperature_fallback=True,
                          condition_on_previous_text=True),
+        BenchmarkVariant(id="beam5", label="Beam search (5)", temperature_fallback=False,
+                         condition_on_previous_text=False, beam_size=5),
+        BenchmarkVariant(id="vad", label="VAD (speech only)", temperature_fallback=False,
+                         condition_on_previous_text=False, vad=True),
+        BenchmarkVariant(id="vad_beam5_fallback", label="VAD + beam 5 + fallback", temperature_fallback=True,
+                         condition_on_previous_text=False, beam_size=5, vad=True),
     )
 }
 
@@ -71,7 +78,7 @@ def variant_options(variant: str, initial_prompt: str | None = None) -> Decoding
     v = VARIANTS[variant]
     return DecodingOptions(temperature_fallback=v.temperature_fallback,
                            condition_on_previous_text=v.condition_on_previous_text,
-                           initial_prompt=initial_prompt or None)
+                           initial_prompt=initial_prompt or None, beam_size=v.beam_size, vad=v.vad)
 
 
 # ------------------------------------------------------------------ scoring
@@ -98,7 +105,7 @@ def clips_from_dir(directory: Path) -> list[EvalClip]:
 
 
 def evaluate(transcriber: Transcriber, clips: list[EvalClip], language: str | None, options: DecodingOptions,
-             on_clip: Callable[[int, EvalClip], None] | None = None) -> BenchmarkResult:
+             on_clip: Callable[[int, EvalClip], None] | None = None, vad=None) -> BenchmarkResult:
     """Transcribe every clip and score it. WER is over all clips together (errors / reference words).
 
     on_clip(i, clip) is called before the i-th clip.
@@ -110,7 +117,7 @@ def evaluate(transcriber: Transcriber, clips: list[EvalClip], language: str | No
             on_clip(i, clip)
         audio = decode_audio(clip.path, as_int16=True)
         t0 = time.perf_counter()
-        hypothesis = transcriber.transcribe(audio, language=language, options=options).text
+        hypothesis = transcribe_with(transcriber, audio, language, options=options, vad=vad).text
         seconds = time.perf_counter() - t0
         score = word_error_rate(clip.reference, hypothesis)
         result.substitutions += score.substitutions
@@ -296,8 +303,9 @@ class BenchmarkRunner:
 
     def __init__(self, store: BenchmarkStore, submit: Callable[[str, Callable[[], None]], None],
                  default_model: tuple[str, Transcriber] | None, models_dir: str,
-                 load_model: Callable[[Path], Transcriber]):
+                 load_model: Callable[[Path], Transcriber], vad=None):
         self.store = store
+        self.vad = vad  # for the VAD variants
         self.submit = submit  # TranscriptionService.submit_task
         self.default_model = default_model  # (id, loaded transcriber) of the service's own model
         self.models_dir = models_dir
@@ -394,8 +402,8 @@ class BenchmarkRunner:
 
                     try:
                         result = evaluate(transcriber, clips, language, variant_options(variant, run.initial_prompt),
-                                          on_clip=on_clip)
-                    except (InvalidAudioError, ValueError) as e:
+                                          on_clip=on_clip, vad=self.vad)
+                    except (InvalidAudioError, ValueError, RuntimeError) as e:  # e.g. VAD not installed
                         result = BenchmarkResult(model=model_id, variant=variant, error=str(e))
                     run.progress.done = done + len(clips)
                     result.model, result.variant = model_id, variant
