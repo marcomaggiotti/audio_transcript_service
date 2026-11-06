@@ -87,6 +87,7 @@ class Job(BaseModel):
     temperature_fallback: bool = Field(False, description="Re-decode windows whose text repeats or is unsure")
     condition_on_previous_text: bool = Field(False, description="Prompt each window with the text before it")
     initial_prompt: str | None = Field(None, description="Vocabulary or style hint given to every window")
+    kv_cache: bool = Field(False, description="Decoder KV cache: faster, same tokens (ONNX engine only)")
     encoder_precision: str | None = Field(None, description="Requested encoder precision (fp32, int8, int4); None = default")
     decoder_precision: str | None = Field(None, description="Requested decoder precision (fp32, int8, int4); None = default")
     engine: str = Field("onnx", description="onnx (ONNX Runtime) or ctranslate2 (CTranslate2 through faster-whisper)")
@@ -199,6 +200,7 @@ class BenchmarkCreate(BaseModel):
     language: str = Field("auto", pattern=r"^([a-z]{2,3}|auto)$")
     initial_prompt: str | None = Field(None, max_length=1000)
     clip_ids: list[str] | None = Field(None, description="Clips to use; all when omitted")
+    kv_cache: bool | None = Field(None, description="Decoder KV cache (faster, same tokens); default KV_CACHE")
 
 
 class ClipResult(BaseModel):
@@ -245,6 +247,7 @@ class BenchmarkRun(BaseModel):
     language: str
     initial_prompt: str | None = None
     clip_ids: list[str]
+    kv_cache: bool = True
     created_at: datetime = Field(default_factory=utcnow)
     started_at: datetime | None = None
     finished_at: datetime | None = None

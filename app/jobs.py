@@ -192,7 +192,7 @@ class TranscriptionService:
                                       condition_on_previous_text=job.condition_on_previous_text,
                                       initial_prompt=job.initial_prompt, beam_size=job.beam_size,
                                       reset_on_loop=job.reset_on_loop, vad=job.vad, vad_threshold=job.vad_threshold,
-                                      vad_min_silence_ms=job.vad_min_silence_ms)
+                                      vad_min_silence_ms=job.vad_min_silence_ms, kv_cache=job.kv_cache)
             def loading(model_id: str) -> None:
                 job.stage = f"loading {model_id}"
 

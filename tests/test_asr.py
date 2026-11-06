@@ -270,3 +270,50 @@ def test_english_only_config_wins_over_language_tokens():
     assert not english.multilingual and english.timestamp_begin == 50363 and english.no_speech == 50361
     multilingual = _resolve_tokens(Tokenizer(), {"no_timestamps_token_id": 50362})
     assert multilingual.lang_to_id == {"en": 50258, "it": 50274}
+
+
+class MergedDecoder(ScriptedDecoder):
+    """Stand-in for optimum's merged decoder: use_cache_branch picks the cached branch, and the "keys" it caches
+    are the token ids themselves, so a step sees past + new tokens exactly when the cache is carried right."""
+
+    def __init__(self, scripts, **kw):
+        super().__init__(scripts, **kw)
+        self.calls: list[tuple[bool, int]] = []  # (cached branch, tokens fed) of every call
+
+    def get_inputs(self):
+        return [SimpleNamespace(name=n) for n in ("input_ids", "encoder_hidden_states", "use_cache_branch")] + [
+            SimpleNamespace(name=f"past_key_values.0.{part}.key", shape=["batch", 1, "seq", 1])
+            for part in ("decoder", "encoder")]
+
+    def get_outputs(self):
+        return [SimpleNamespace(name=n) for n in ("logits", "present.0.decoder.key", "present.0.encoder.key")]
+
+    def run(self, outputs, feeds):
+        cached = bool(feeds["use_cache_branch"][0])
+        new = feeds["input_ids"][0].tolist()
+        past = feeds["past_key_values.0.decoder.key"].reshape(-1).astype(int).tolist() if cached else []
+        self.calls.append((cached, len(new)))
+        ids = past + new
+        [logits] = super().run(None, {"input_ids": np.array([ids]), "encoder_hidden_states": feeds["encoder_hidden_states"]})
+        produced = {"logits": logits, "present.0.decoder.key": np.array(ids, np.float32).reshape(1, 1, -1, 1),
+                    "present.0.encoder.key": np.zeros((1, 1, 1500, 1), np.float32)}
+        return [produced[name] for name in (outputs or [o.name for o in self.get_outputs()])]
+
+
+@pytest.mark.parametrize("beam_size", [1, 3])
+def test_kv_cache_changes_the_work_not_the_transcript(beam_size):
+    scripts = [[ts(0), 0, 1, ts(2.0), ts(2.0), 2, 3, ts(29.0), EOT], [ts(1.0), 4, ts(3.0), EOT]]
+    audio = np.zeros(16000 * 40, dtype=np.float32)
+    results, calls = {}, {}
+    for kv_cache in (True, False):
+        decoder = MergedDecoder(scripts)
+        t = OnnxWhisperTranscriber(FakeEncoder(), decoder, FakeTokenizer(), make([]).tokens)
+        result = t.transcribe(audio, "en", options=DecodingOptions(kv_cache=kv_cache, beam_size=beam_size,
+                                                                   condition_on_previous_text=True))
+        results[kv_cache] = [(s.start, s.end, s.text, s.avg_logprob) for s in result.segments]
+        calls[kv_cache] = [c for c in decoder.calls if c != (False, 1)]  # minus the one-token language steps
+    assert results[True] == results[False]
+    assert results[True][0][2] == "hello world" and results[True][-1][2] == "bye"
+    # Cached: after the prompt, one new token per call. Off: always the first-call branch, with the whole text.
+    assert all(n == 1 for cached, n in calls[True] if cached) and any(cached for cached, _ in calls[True])
+    assert not any(cached for cached, _ in calls[False]) and max(n for _, n in calls[False]) > 5

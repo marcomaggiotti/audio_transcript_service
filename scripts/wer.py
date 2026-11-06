@@ -29,6 +29,7 @@ def main() -> int:
                         help="Decoding variant; repeat to compare (default: all)")
     parser.add_argument("--language", default="auto", help="e.g. en, it, de; auto detects per clip")
     parser.add_argument("--initial-prompt", help="Vocabulary or style hint given to every window")
+    parser.add_argument("--kv-cache", action="store_true", help="Decoder KV cache: same transcripts, faster")
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--details", action="store_true", help="Show the worst clips of every run")
     args = parser.parse_args()
@@ -48,7 +49,7 @@ def main() -> int:
         load_s = time.perf_counter() - t0
         for variant in args.variant or list(VARIANTS):
             print(f"{model.name} · {VARIANTS[variant].label} …", flush=True)
-            result = evaluate(model, clips, language, variant_options(variant, args.initial_prompt))
+            result = evaluate(model, clips, language, variant_options(variant, args.initial_prompt, args.kv_cache))
             rows.append((model.name, VARIANTS[variant].label, result, load_s))
             if args.details:
                 for clip in sorted(result.clips, key=lambda c: c.wer, reverse=True)[:5]:

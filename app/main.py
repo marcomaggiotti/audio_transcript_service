@@ -254,7 +254,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
                    intervals: list[tuple[float, float]] | None = None, beam_size: int | None = None,
                    reset_on_loop: bool | None = None, vad: bool | None = None, vad_threshold: float | None = None,
                    vad_min_silence_ms: int | None = None, engine: str | None = None,
-                   compute_type: str | None = None) -> Job:
+                   compute_type: str | None = None, kv_cache: bool | None = None) -> Job:
         """Queue the audio at service.upload_path(job_id), with the default decoding options unless given."""
         job = Job(
             id=job_id, filename=filename, size_bytes=size, language=None if language == "auto" else language,
@@ -263,6 +263,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
             condition_on_previous_text=(settings.condition_on_previous_text if condition_on_previous_text is None
                                         else condition_on_previous_text),
             initial_prompt=(initial_prompt or settings.initial_prompt or "").strip() or None,
+            kv_cache=settings.kv_cache if kv_cache is None else kv_cache,
             encoder_precision=encoder, decoder_precision=decoder,
             requested_model=service.models.find(model).id if model else None,
             intervals=intervals,
@@ -344,6 +345,8 @@ def create_app(settings: Settings | None = None, components: Components | None =
     previous_param = Form(None, description="Prompt each 30 s window with the text before it "
                                             "(default: CONDITION_ON_PREVIOUS_TEXT)")
     prompt_param = Form(None, max_length=1000, description="Vocabulary or style hint, e.g. names and terms")
+    kv_cache_param = Form(None, description="Decoder KV cache: several times faster, the same tokens; ONNX engine "
+                                            "only (default: KV_CACHE)")
     encoder_param = Form(None, pattern=r"^(fp32|int8|int4)$",
                          description="Encoder precision: fp32 (full, the default) or int8 (smaller, less accurate)")
     decoder_param = Form(None, pattern=r"^(fp32|int8|int4)$",
@@ -386,7 +389,8 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          reset_on_loop: bool | None = reset_param, vad: bool | None = vad_param,
                          vad_threshold: float | None = vad_threshold_param,
                          vad_min_silence_ms: int | None = vad_silence_param,
-                         engine: str | None = engine_param, compute_type: str | None = compute_type_param):
+                         engine: str | None = engine_param, compute_type: str | None = compute_type_param,
+                         kv_cache: bool | None = kv_cache_param):
         """Upload audio and wait for its transcript. Shares the job queue, so it waits its turn."""
         service = service_of(request)
         job = await accept_upload(service, file, language, temperature_fallback=temperature_fallback,
@@ -394,7 +398,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
                                   initial_prompt=initial_prompt, encoder=encoder, decoder=decoder, model=model,
                                   intervals=intervals, beam_size=beam_size, reset_on_loop=reset_on_loop, vad=vad,
                                   vad_threshold=vad_threshold, vad_min_silence_ms=vad_min_silence_ms,
-                                  engine=engine, compute_type=compute_type)
+                                  engine=engine, compute_type=compute_type, kv_cache=kv_cache)
         try:
             job = await service.wait(job.id)
         finally:
@@ -416,7 +420,8 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          reset_on_loop: bool | None = reset_param, vad: bool | None = vad_param,
                          vad_threshold: float | None = vad_threshold_param,
                          vad_min_silence_ms: int | None = vad_silence_param,
-                         engine: str | None = engine_param, compute_type: str | None = compute_type_param):
+                         engine: str | None = engine_param, compute_type: str | None = compute_type_param,
+                         kv_cache: bool | None = kv_cache_param):
         """Upload audio for background transcription; poll the status URL, then fetch the transcript.
 
         `model` picks the speech model and `encoder` / `decoder` the precision of each part for this job (see
@@ -426,7 +431,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
                                   initial_prompt=initial_prompt, encoder=encoder, decoder=decoder, model=model,
                                   intervals=intervals, beam_size=beam_size, reset_on_loop=reset_on_loop, vad=vad,
                                   vad_threshold=vad_threshold, vad_min_silence_ms=vad_min_silence_ms,
-                                  engine=engine, compute_type=compute_type)
+                                  engine=engine, compute_type=compute_type, kv_cache=kv_cache)
         return summary(job)
 
     @app.get("/jobs", response_model=list[JobSummary])
@@ -620,7 +625,8 @@ def create_app(settings: Settings | None = None, components: Components | None =
         """Queue a run: every clip, with each model and decoding variant. It shares the transcription queue."""
         run = BenchmarkRun(id=uuid.uuid4().hex, models=list(dict.fromkeys(body.models)),
                            variants=list(dict.fromkeys(body.variants)), language=body.language,
-                           initial_prompt=(body.initial_prompt or "").strip() or None, clip_ids=body.clip_ids or [])
+                           initial_prompt=(body.initial_prompt or "").strip() or None, clip_ids=body.clip_ids or [],
+                           kv_cache=settings.kv_cache if body.kv_cache is None else body.kv_cache)
         try:
             return runner_of(request).create(run)
         except BenchmarkError as e:
@@ -686,6 +692,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          "compression_ratio_threshold": asr.COMPRESSION_RATIO_THRESHOLD,
                          "logprob_threshold": asr.LOGPROB_THRESHOLD, "no_speech_threshold": asr.NO_SPEECH_THRESHOLD,
                          "condition_on_previous_text": settings.condition_on_previous_text,
+                         "kv_cache": settings.kv_cache,
                          "initial_prompt": settings.initial_prompt,
                          "beam_size": settings.beam_size, "max_beam_size": asr.MAX_BEAM_SIZE,
                          "reset_prompt_on_loop": settings.reset_prompt_on_loop,

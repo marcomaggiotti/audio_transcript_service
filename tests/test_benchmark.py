@@ -156,9 +156,12 @@ def test_benchmark_run_scores_models_and_variants(bench, transcriber, settings):
     assert (base["substitutions"], base["deletions"], base["insertions"]) == (4, 32, 0)
     assert base["wer"] == round(36 / 46, 4)
 
+    # KV_CACHE is off by default, and a run without kv_cache follows it.
+    assert run["kv_cache"] is False
     assert transcriber.options == [
-        DecodingOptions(initial_prompt="ONNX")] * 2 + [
-        DecodingOptions(temperature_fallback=True, condition_on_previous_text=True, initial_prompt="ONNX")] * 2
+        DecodingOptions(initial_prompt="ONNX", kv_cache=False)] * 2 + [
+        DecodingOptions(temperature_fallback=True, condition_on_previous_text=True, initial_prompt="ONNX",
+                        kv_cache=False)] * 2
     assert transcriber.languages[-4:] == ["en"] * 4
 
     listed = bench.get("/benchmarks").json()
@@ -223,11 +226,17 @@ def test_decoding_options_on_jobs(client, transcriber):
     client.post("/jobs", files={"file": ("a.wav", make_wav(), "audio/wav")})
     job = client.post("/jobs", files={"file": ("a.wav", make_wav(), "audio/wav")},
                       data={"temperature_fallback": "false", "initial_prompt": " ONNX, Whisper "}).json()
+    faster = client.post("/jobs", files={"file": ("a.wav", make_wav(), "audio/wav")},
+                         data={"kv_cache": "true", "condition_on_previous_text": "true"}).json()
     status = wait_for(client, job["id"])
-    assert (status["temperature_fallback"], status["condition_on_previous_text"]) == (False, True)
+    assert (status["temperature_fallback"], status["condition_on_previous_text"], status["kv_cache"]) == (
+        False, False, False)
+    assert wait_for(client, faster["id"])["kv_cache"] is True
+    # Defaults: fallback on; previous-text prompt and KV cache off (the slow path). A request can turn each on.
     assert transcriber.options == [
-        DecodingOptions(temperature_fallback=True, condition_on_previous_text=True),
-        DecodingOptions(temperature_fallback=False, condition_on_previous_text=True, initial_prompt="ONNX, Whisper"),
+        DecodingOptions(temperature_fallback=True, kv_cache=False),
+        DecodingOptions(temperature_fallback=False, initial_prompt="ONNX, Whisper", kv_cache=False),
+        DecodingOptions(temperature_fallback=True, condition_on_previous_text=True, kv_cache=True),
     ]
 
 

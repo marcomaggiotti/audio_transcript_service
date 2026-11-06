@@ -64,12 +64,16 @@ services:
       # Skip ONNX Runtime's pre-packed weight copies: ~25 MB less RAM, transcription ~1.5x slower.
       - key: WHISPER_LOW_MEMORY
         value: "true"
-      # Decoding defaults (requests can override them): re-decode repetitive or unsure windows, and
-      # prompt each window with the text before it.
+      # Decoding defaults (requests can override them): re-decode repetitive or unsure windows. Previous-text
+      # prompt off: a wrongly transcribed window would mislead the next one.
       - key: TEMPERATURE_FALLBACK
         value: "true"
       - key: CONDITION_ON_PREVIOUS_TEXT
-        value: "true"
+        value: "false"
+      # Decoder KV cache: a speed-up only, the same transcript. Off for now (the slow path); "true" is several
+      # times faster.
+      - key: KV_CACHE
+        value: "false"
 
       # --- Access control ---
       - key: API_TOKEN

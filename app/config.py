@@ -33,7 +33,11 @@ class Settings(BaseModel):
     # Decoding defaults (a request can override them): openai/whisper's temperature fallback, and
     # prompting each 30 s window with the text before it. INITIAL_PROMPT: vocabulary/style hint.
     temperature_fallback: bool = _flag("TEMPERATURE_FALLBACK", "true")
-    condition_on_previous_text: bool = _flag("CONDITION_ON_PREVIOUS_TEXT", "true")
+    # Off by default: a wrongly transcribed window would be fed to the next one as its prompt.
+    condition_on_previous_text: bool = _flag("CONDITION_ON_PREVIOUS_TEXT", "false")
+    # Decoder KV cache: a speed-up only (the same tokens either way). Off by default, the slowest and simplest
+    # path for now: every step re-runs the decoder over the whole text so far. KV_CACHE=true is several times faster.
+    kv_cache: bool = _flag("KV_CACHE", "false")
     initial_prompt: str | None = _env("INITIAL_PROMPT")
     # Beam search at temperature 0 (1 = greedy; openai/whisper uses 5): fewer word errors, decoder ~3-5x slower.
     beam_size: int = int(_env("BEAM_SIZE", "1"))

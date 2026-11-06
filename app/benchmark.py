@@ -74,11 +74,12 @@ class NotFound(KeyError):
     pass
 
 
-def variant_options(variant: str, initial_prompt: str | None = None) -> DecodingOptions:
+def variant_options(variant: str, initial_prompt: str | None = None, kv_cache: bool = True) -> DecodingOptions:
     v = VARIANTS[variant]
     return DecodingOptions(temperature_fallback=v.temperature_fallback,
                            condition_on_previous_text=v.condition_on_previous_text,
-                           initial_prompt=initial_prompt or None, beam_size=v.beam_size, vad=v.vad)
+                           initial_prompt=initial_prompt or None, beam_size=v.beam_size, vad=v.vad,
+                           kv_cache=kv_cache)
 
 
 # ------------------------------------------------------------------ scoring
@@ -401,7 +402,7 @@ class BenchmarkRunner:
                         run.progress.current = f"{model_id} · {VARIANTS[variant].label} · {clip.name}"
 
                     try:
-                        result = evaluate(transcriber, clips, language, variant_options(variant, run.initial_prompt),
+                        result = evaluate(transcriber, clips, language, variant_options(variant, run.initial_prompt, run.kv_cache),
                                           on_clip=on_clip, vad=self.vad)
                     except (InvalidAudioError, ValueError, RuntimeError) as e:  # e.g. VAD not installed
                         result = BenchmarkResult(model=model_id, variant=variant, error=str(e))

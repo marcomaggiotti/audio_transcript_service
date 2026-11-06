@@ -93,12 +93,21 @@ options follow openai/whisper:
   below −1) is decoded again, sampling at temperatures 0.2, 0.4 … 1.0, until it passes. A window Whisper
   thinks is silence (no-speech probability above 0.6, text unsure) gives no text at all. This fixes most
   hallucinations and repetition loops, at the cost of extra decoding on bad windows only.
-- **Previous-text prompt** (`CONDITION_ON_PREVIOUS_TEXT`, `condition_on_previous_text`): each window is
-  prompted with the text decoded before it (up to 223 tokens), which keeps names and spelling consistent.
+- **Previous-text prompt** (`CONDITION_ON_PREVIOUS_TEXT`, `condition_on_previous_text`, **off by default**): each
+  window is prompted with the text decoded before it (up to 223 tokens), which keeps names and spelling consistent,
+  but a window transcribed wrongly then misleads the next one. This is the setting that reuses earlier words.
   It's dropped after a window that needed a high temperature, and (`RESET_PROMPT_ON_LOOP`, `reset_on_loop`,
   on by default) after a window whose text loops (compression ratio above 2.4), so one mistake doesn't spread
   and a loop doesn't snowball into the next window. The window trace marks such a window `prompt_reset`. With a
   small model such as whisper-tiny, turning previous text off altogether is often better: measure it.
+- **KV cache** (`KV_CACHE`, `kv_cache`, **off by default**; Transcribe and Benchmark tabs: "KV cache (faster)"):
+  Whisper writes a window one word-piece at a time, each step reading every piece written so far. With the cache,
+  the decoder keeps its intermediate results (keys and values) for the pieces already read, so a step only
+  computes the new one; without it, every step recomputes them all. That is a speed-up only: either way each step
+  sees exactly the same words, right or wrong, and a mistake is not "kept" any more by the cache than without it.
+  The transcript is the same (with the int8 decoder, rounding can very rarely change a word: compare both in the
+  Benchmark tab). Off is the slow, simple path for now; on is several times faster, more so for long windows.
+  The CTranslate2 engine always uses its own cache.
 - **Beam search** (`BEAM_SIZE`, `beam_size`, default 1 = greedy, up to 8): at temperature 0 the decoder keeps that
   many candidate texts in parallel and picks the one with the best mean log-probability per token, as openai/whisper
   does with 5. Usually noticeably fewer word errors, more so on a weak model; the decoder is about 3-5x slower (the
@@ -298,7 +307,8 @@ pytest
 | `MAX_NEW_TOKENS` | `224` | Decoder tokens per 30 s window |
 | `ONNX_THREADS` | `0` (auto) | ONNX Runtime threads; set to the instance's CPU count |
 | `WHISPER_LOW_MEMORY` | `false` | About 25 MB less RAM, about 1.5x slower transcription |
-| `TEMPERATURE_FALLBACK` / `CONDITION_ON_PREVIOUS_TEXT` | `true` / `true` | Decoding defaults; requests can override them |
+| `TEMPERATURE_FALLBACK` / `CONDITION_ON_PREVIOUS_TEXT` | `true` / `false` | Decoding defaults; requests can override them |
+| `KV_CACHE` | `false` | Decoder KV cache: same transcript, several times faster when `true`; requests can override it |
 | `BEAM_SIZE` / `RESET_PROMPT_ON_LOOP` | `1` / `true` | Beam search width (1 = greedy); stop carrying text after a loop |
 | `VAD` / `VAD_THRESHOLD` / `VAD_MIN_SILENCE_MS` | `false` / `0.5` / `500` | Voice activity detection defaults; requests can override them |
 | `VAD_MODEL_PATH` | `./models/vad/silero_vad.onnx` | Silero VAD model (the Docker image has it) |
