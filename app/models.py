@@ -1,9 +1,10 @@
 """The speech models a job can choose: the service's own (loaded at start) and the extra exports in MODELS_DIR.
 
-The service's model stays loaded. Another model is loaded for the job that asks for it and released after
-it, like a non-default precision: jobs run one at a time, so at most one extra model is in memory. Before
-loading one, its size is checked against the container's memory, so a model too big for the plan is
-refused with the reason instead of the process being killed (whisper-small needs ~1 GB: Render Standard).
+All English-only (openai/whisper-*.en): a multilingual export in MODELS_DIR is left out. The service's model stays
+loaded. Another model is loaded for the job that asks for it and released after it, like a non-default precision:
+jobs run one at a time, so at most one extra model is in memory. Before loading one, its size is checked against
+the container's memory, so a model too big for the plan is refused with the reason instead of the process being
+killed (whisper-small.en needs ~1 GB: Render Standard).
 """
 
 import gc
@@ -15,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from app.asr import PRECISIONS, Transcriber, _release_memory, onnx_precision
+from app.asr import PRECISIONS, Transcriber, _release_memory, is_multilingual_config, onnx_precision
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +31,11 @@ class ModelUnavailable(ValueError):
 
 @dataclass
 class ModelInfo:
-    id: str  # the Hugging Face id from model_id.txt, e.g. openai/whisper-small
+    id: str  # the Hugging Face id from model_id.txt, e.g. openai/whisper-base.en
     path: Path
     default: bool = False
     precision: dict[str, str] = field(default_factory=dict)  # the export's default {encoder, decoder}
     available_precisions: dict[str, list[str]] = field(default_factory=dict)
-    languages: list[str] = field(default_factory=list)
     size_mb: float = 0.0  # the default encoder + decoder files
 
     @property
@@ -45,8 +45,7 @@ class ModelInfo:
 
     def view(self, fits: bool | None, reason: str | None) -> dict:
         return {"id": self.id, "default": self.default, "precision": self.precision,
-                "available_precisions": self.available_precisions, "languages": len(self.languages),
-                "multilingual": len(self.languages) > 1, "size_mb": round(self.size_mb),
+                "available_precisions": self.available_precisions, "size_mb": round(self.size_mb),
                 "needs_mb": None if self.default else self.needs_mb, "fits": fits, "reason": reason}
 
 
@@ -66,13 +65,15 @@ def describe_export(path: Path, default: bool = False) -> ModelInfo:
         stem = default_file.removesuffix(".onnx")
         info.available_precisions[part] = sorted({info.precision[part]} | {
             p for p in PRECISIONS if (path / f"{stem}.{p}.onnx").exists()})
-    try:
-        config = json.loads((path / "generation_config.json").read_text())
-        multilingual = config.get("is_multilingual") is not False  # whisper-*.en say false
-        info.languages = [code.strip("<|>") for code in (config.get("lang_to_id") or {}) if multilingual] or ["en"]
-    except (OSError, ValueError):
-        info.languages = []
     return info
+
+
+def is_multilingual(path: Path) -> bool:
+    """Whether an export is a multilingual Whisper, which the service refuses to load (app/asr.py)."""
+    try:
+        return is_multilingual_config(json.loads((path / "generation_config.json").read_text()))
+    except (OSError, ValueError):
+        return False
 
 
 def memory_limit_mb() -> float | None:
@@ -126,6 +127,9 @@ class ModelSet:
         for path in discover_exports(models_dir) if models_dir else []:
             if default_path and path.resolve() == default_path:
                 continue
+            if is_multilingual(path):
+                logger.warning("Skipping %s: a multilingual model; the service runs English-only ones", path)
+                continue
             info = describe_export(path)
             self._models.setdefault(info.id, info)  # the same model exported twice: the first wins
 
@@ -133,7 +137,7 @@ class ModelSet:
         return list(self._models.values())
 
     def find(self, model_id: str | None) -> ModelInfo | None:
-        """By id (openai/whisper-small), short name (whisper-small) or folder name; None = the default."""
+        """By id (openai/whisper-base.en), short name (whisper-base.en) or folder name; None = the default."""
         if not model_id:
             return next((m for m in self._models.values() if m.default), None)
         for m in self._models.values():
@@ -151,16 +155,13 @@ class ModelSet:
         if info.needs_mb <= free:
             return True, None
         return False, (f"{info.id} needs about {info.needs_mb:.0f} MB and this server has about {max(free, 0):.0f} MB "
-                       f"free of {self.limit_mb:.0f} MB: use a larger plan (Render Standard, 2 GB, for whisper-small)")
+                       f"free of {self.limit_mb:.0f} MB: use a larger plan (Render Standard, 2 GB, for whisper-small.en)")
 
-    def check(self, model_id: str | None, language: str | None = None) -> ModelInfo:
+    def check(self, model_id: str | None) -> ModelInfo:
         info = self.find(model_id)
         if info is None:
             have = ", ".join(m.id for m in self._models.values()) or "none"
             raise ModelUnavailable(f"Unknown model '{model_id}' (this service has: {have}); see GET /config")
-        if language and info.languages and language not in info.languages:
-            raise ModelUnavailable(f"{info.id} can't transcribe '{language}'"
-                                   + (" (English-only model)" if info.languages == ["en"] else ""))
         ok, reason = self.fits(info)
         if ok is False:
             raise ModelUnavailable(reason)

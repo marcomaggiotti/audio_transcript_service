@@ -44,8 +44,7 @@ def wav_seconds(data: bytes) -> float:
 
 
 def add_source(client, seconds=20.0):
-    response = client.post("/benchmark/sources", files={"file": ("episode.wav", make_wav(seconds), "audio/wav")},
-                           data={"language": "en"})
+    response = client.post("/benchmark/sources", files={"file": ("episode.wav", make_wav(seconds), "audio/wav")})
     assert response.status_code == 202, response.text
     source = response.json()
     wait_for(client, source["job_id"])
@@ -135,7 +134,7 @@ def test_benchmark_run_scores_models_and_variants(bench, transcriber, settings):
     transcriber.options.clear()
 
     response = bench.post("/benchmarks", json={"models": ["whisper-tiny", "whisper-base"],
-                                               "variants": ["greedy", "fallback_previous"], "language": "en",
+                                               "variants": ["greedy", "fallback_previous"],
                                                "initial_prompt": "ONNX"})
     assert response.status_code == 202, response.text
     run = wait_run(bench, response.json()["id"])
@@ -161,7 +160,6 @@ def test_benchmark_run_scores_models_and_variants(bench, transcriber, settings):
     assert transcriber.options == [
         DecodingOptions(initial_prompt="ONNX")] * 2 + [
         DecodingOptions(temperature_fallback=True, condition_on_previous_text=True, initial_prompt="ONNX")] * 2
-    assert transcriber.languages[-4:] == ["en"] * 4
 
     listed = bench.get("/benchmarks").json()
     assert [r["id"] for r in listed] == [run["id"]] and "clips" not in listed[0]["results"][0]
@@ -214,8 +212,7 @@ def test_interrupted_run_is_marked_failed(settings, transcriber):
 
     store = BenchmarkStore(settings.benchmark_dir)
     store.setup()
-    store.save_run(BenchmarkRun(id="a" * 32, status="processing", models=["m"], variants=["greedy"],
-                                language="en", clip_ids=[]))
+    store.save_run(BenchmarkRun(id="a" * 32, status="processing", models=["m"], variants=["greedy"], clip_ids=[]))
     with TestClient(create_app(settings, Components(transcriber=transcriber))) as client:
         run = client.get(f"/benchmarks/{'a' * 32}").json()
         assert run["status"] == "failed" and "restart" in run["error"]

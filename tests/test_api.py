@@ -16,10 +16,10 @@ def upload(client, path="/jobs", data=None, content=None, headers=None, params=N
 
 
 def test_transcribe_returns_json_transcript(client, transcriber):
-    response = upload(client, "/transcribe", data={"language": "en"})
+    response = upload(client, "/transcribe")
     assert response.status_code == 200
     body = response.json()
-    assert body["language"] == "en"
+    assert body["language"] == "en"  # always: English-only models
     assert body["model"] == "fake-whisper"
     assert body["duration_seconds"] == 1.0
     assert body["text"].startswith("Welcome to the show")
@@ -27,13 +27,7 @@ def test_transcribe_returns_json_transcript(client, transcriber):
     assert body["segments"][1] == {"index": 1, "start": 4.2, "end": 9.8, "avg_logprob": -0.3, "no_speech_prob": 0.01,
                                    "text": "Today we talk about ONNX Runtime and model deployment."}
     assert body["metrics"]["audio_seconds"] == 1.0
-    assert transcriber.languages == ["en"]
     assert client.get("/jobs").json() == []  # synchronous requests leave no job behind
-
-
-def test_transcribe_auto_language_by_default(client, transcriber):
-    assert upload(client, "/transcribe").status_code == 200
-    assert transcriber.languages == [None]  # None = detect
 
 
 @pytest.mark.parametrize("fmt,media_type,expected", [
@@ -50,7 +44,7 @@ def test_transcribe_output_formats(client, fmt, media_type, expected):
 
 
 def test_job_lifecycle(client):
-    response = upload(client, data={"language": "de"})
+    response = upload(client)
     assert response.status_code == 202
     job = response.json()
     assert job["status_url"] == f"/jobs/{job['id']}"
@@ -62,7 +56,7 @@ def test_job_lifecycle(client):
     assert "transcript" not in status
 
     transcript = client.get(job["transcript_url"]).json()
-    assert transcript["language"] == "de" and len(transcript["segments"]) == 3
+    assert transcript["language"] == "en" and len(transcript["segments"]) == 3
     assert client.get(job["transcript_url"], params={"format": "text"}).text.endswith("next week.\n")
     assert [j["id"] for j in client.get("/jobs").json()] == [job["id"]]
 
@@ -115,16 +109,11 @@ def test_rejects_too_long_audio(client):
     assert status["status"] == "failed" and "60s limit" in status["error"]
 
 
-def test_rejects_unsupported_language(client):
-    response = upload(client, data={"language": "fr"})
-    assert response.status_code == 422 and "/languages" in response.json()["detail"]
-    assert upload(client, data={"language": "english"}).status_code == 422  # not an ISO code
-
-
-def test_languages_and_health(client):
-    assert client.get("/languages").json() == {"languages": ["en", "de", "it"], "default": "auto"}
+def test_health(client):
     health = client.get("/health").json()
     assert health["status"] == "ok" and health["model"] == "fake-whisper"
+    assert health["languages"] == ["en"]  # for clients that ask: English-only
+    assert client.get("/languages").status_code == 404
     assert client.get("/healthz").status_code == 200
 
 
@@ -173,7 +162,6 @@ def test_api_token(settings, transcriber):
     with TestClient(create_app(settings, Components(transcriber=transcriber))) as client:
         assert upload(client, "/transcribe").status_code == 401
         assert client.get("/jobs").status_code == 401
-        assert client.get("/languages").status_code == 401
         assert upload(client, "/transcribe", headers={"X-API-Key": "wrong"}).status_code == 401
         assert upload(client, "/transcribe", headers={"X-API-Key": "secret"}).status_code == 200
         assert upload(client, "/transcribe", headers={"Authorization": "bearer secret"}).status_code == 200
@@ -225,7 +213,7 @@ def test_precision_must_be_in_the_export(client):
 def test_transcribe_on_given_intervals(client, transcriber):
     """One segment per requested span, at the span's times, transcribed on its own without the previous text."""
     response = upload(client, "/transcribe", content=make_wav(3.0),
-                      data={"language": "en", "condition_on_previous_text": "true",
+                      data={"condition_on_previous_text": "true",
                             "intervals": "[[0, 1.2], [1.2, 2.5], [2.5, 2.55]]"})
     assert response.status_code == 200
     body = response.json()
@@ -251,11 +239,11 @@ class SpinningTranscriber(FakeTranscriber):
         self.started = threading.Event()
         self.stopped = threading.Event()
 
-    def transcribe(self, audio, language=None, on_progress=None, options=None):
+    def transcribe(self, audio, on_progress=None, options=None):
         from app.asr import Cancelled, check_cancelled
 
         if self.calls:  # every job after the first is quick
-            return super().transcribe(audio, language, on_progress, options)
+            return super().transcribe(audio, on_progress, options)
         self.calls += 1
         self.started.set()
         deadline = time.monotonic() + 10
@@ -266,7 +254,7 @@ class SpinningTranscriber(FakeTranscriber):
         except Cancelled:
             self.stopped.set()
             raise
-        return super().transcribe(audio, language, on_progress, options)
+        return super().transcribe(audio, on_progress, options)
 
 
 def test_deleting_a_running_job_stops_it_and_frees_the_worker(settings):

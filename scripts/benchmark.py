@@ -23,7 +23,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("audio")
     parser.add_argument("--model-dir", default="models/whisper-tiny.en")
-    parser.add_argument("--language", default="auto")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--threads", type=int, default=0)
     args = parser.parse_args()
@@ -40,7 +39,7 @@ def main() -> None:
     latencies = []
     for i in range(args.runs):
         t0 = time.perf_counter()
-        result = model.transcribe(audio, language=args.language)
+        result = model.transcribe(audio)
         latencies.append(time.perf_counter() - t0)
         print(f"run {i + 1}: {latencies[-1]:.2f}s, {len(result.segments)} segments")
 

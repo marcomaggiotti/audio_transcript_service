@@ -178,21 +178,19 @@ def _compression_ratio(text: str) -> float:
     return len(data) / len(zlib.compress(data)) if data else 0.0
 
 
-def transcribe_speech(transcriber: Transcriber, vad: SileroVad, audio: np.ndarray, language: str | None = None,
+def transcribe_speech(transcriber: Transcriber, vad: SileroVad, audio: np.ndarray,
                       on_progress: Callable[[float], None] | None = None,
                       options: DecodingOptions | None = None) -> TranscriptionResult:
     """Transcribe only the speech: piece by piece, each up to 30 s of speech cut at pauses."""
     options = options or DecodingOptions()
     spans = vad.speech_spans(audio, options.vad_threshold, options.vad_min_silence_ms)
-    detected = None if language in (None, "", "auto") else language
     segments, windows = [], []
     total = sum(b - a for a, b in spans) or 1.0
     done, previous = 0.0, ""
     for group in pieces(spans):
         piece = np.concatenate([audio[int(a * SAMPLE_RATE) : int(b * SAMPLE_RATE)] for a, b in group])
         prompt = " ".join(p for p in (options.initial_prompt, previous[-PREVIOUS_TEXT_CHARS:]) if p) or None
-        result = transcriber.transcribe(piece, language=detected, options=replace(options, initial_prompt=prompt))
-        detected = detected or result.language
+        result = transcriber.transcribe(piece, options=replace(options, initial_prompt=prompt))
         at = _Timeline(group)
         for s in result.segments:
             if s.text.strip():
@@ -215,7 +213,7 @@ def transcribe_speech(transcriber: Transcriber, vad: SileroVad, audio: np.ndarra
             on_progress(min(1.0, done / total))
     if on_progress and not spans:
         on_progress(1.0)
-    return TranscriptionResult(language=detected, segments=segments, windows=windows, speech=spans)
+    return TranscriptionResult(segments=segments, windows=windows, speech=spans)
 
 
 class SpeechOnly:
@@ -224,11 +222,11 @@ class SpeechOnly:
     def __init__(self, transcriber: Transcriber, vad: SileroVad):
         self.transcriber, self.vad, self.name = transcriber, vad, transcriber.name
 
-    def transcribe(self, audio, language=None, on_progress=None, options=None) -> TranscriptionResult:
-        return transcribe_speech(self.transcriber, self.vad, audio, language, on_progress, options)
+    def transcribe(self, audio, on_progress=None, options=None) -> TranscriptionResult:
+        return transcribe_speech(self.transcriber, self.vad, audio, on_progress, options)
 
 
-def transcribe_with(transcriber: Transcriber, audio: np.ndarray, language: str | None = None,
+def transcribe_with(transcriber: Transcriber, audio: np.ndarray,
                     on_progress: Callable[[float], None] | None = None, options: DecodingOptions | None = None,
                     vad: SileroVad | None = None,
                     intervals: list[tuple[float, float]] | None = None) -> TranscriptionResult:
@@ -240,8 +238,8 @@ def transcribe_with(transcriber: Transcriber, audio: np.ndarray, language: str |
                                "(VAD_MODEL_PATH)")
         transcriber = SpeechOnly(transcriber, vad)
     if intervals:
-        return transcribe_intervals(transcriber, audio, intervals, language, on_progress, options)
-    return transcriber.transcribe(audio, language=language, on_progress=on_progress, options=options)
+        return transcribe_intervals(transcriber, audio, intervals, on_progress, options)
+    return transcriber.transcribe(audio, on_progress=on_progress, options=options)
 
 
 def load_vad(path: str | None) -> tuple[SileroVad | None, str | None]:

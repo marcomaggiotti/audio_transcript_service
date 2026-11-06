@@ -4,7 +4,7 @@ from app.schemas import Transcript, TranscriptSegment
 
 def transcript(*segments):
     return Transcript(
-        language="en", duration_seconds=4000.0, text=" ".join(t for _, _, t in segments),
+        duration_seconds=4000.0, text=" ".join(t for _, _, t in segments),
         segments=[TranscriptSegment(index=i, start=s, end=e, text=t) for i, (s, e, t) in enumerate(segments)],
     )
 

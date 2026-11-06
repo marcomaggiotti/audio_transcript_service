@@ -57,10 +57,6 @@ class TranscriptionService:
         self._workers: list[asyncio.Task] = []
         self.active = 0  # jobs currently being transcribed
 
-    @property
-    def languages(self) -> list[str]:
-        return list(getattr(self.transcriber, "supported_languages", None) or [])
-
     def upload_path(self, job_id: str) -> Path:
         return self.upload_dir / job_id
 
@@ -227,7 +223,7 @@ class TranscriptionService:
                 job.stage, job.model = "transcribing", self.ct2.name
                 job.precision = {"encoder": job.compute_type or "int8", "decoder": job.compute_type or "int8"}
                 weights_mb = self.ct2.size_mb()
-                result = self.ct2.transcribe(loaded.pop(), audio, job.language, options, progress)
+                result = self.ct2.transcribe(loaded.pop(), audio, options, progress)
             else:
                 result, t_load, weights_mb = self._onnx(job, audio, options, progress, loading)
             t2 = time.perf_counter()
@@ -248,25 +244,24 @@ class TranscriptionService:
         with self.models.use(job.requested_model, on_load=loading) as transcriber:
             job.stage = "transcribing"
             # Only the speech (VAD), and one segment per requested interval, when the job asks for them.
-            def run(audio, language, on_progress, options, _t=transcriber):
-                return transcribe_with(_t, audio, language, on_progress, options, self.vad, job.intervals)
+            def run(audio, on_progress, options, _t=transcriber):
+                return transcribe_with(_t, audio, on_progress, options, self.vad, job.intervals)
             t_load = time.perf_counter()  # inference is timed from here: loading isn't inference
             job.model = transcriber.name
             switch = getattr(transcriber, "precision_for", None)  # absent on test fakes
             if switch is None:
                 job.precision = getattr(transcriber, "precision", None)
-                result = run(audio, language=job.language, on_progress=progress, options=options)
+                result = run(audio, on_progress=progress, options=options)
             else:
                 with switch(job.encoder_precision, job.decoder_precision) as used:
                     job.precision = used
-                    result = run(audio, language=job.language, on_progress=progress, options=options)
+                    result = run(audio, on_progress=progress, options=options)
             weights = getattr(transcriber, "weights_mb", lambda used: None)(job.precision)
         return result, t_load, weights
 
     def _finish(self, job: Job, result, seconds: float, t0: float, t1: float, t_load: float, t2: float,
                 weights_mb: float | None) -> None:
         job.transcript = Transcript(
-            language=result.language or job.language,
             duration_seconds=round(seconds, 2),
             text=result.text,
             segments=[TranscriptSegment(index=i, start=s.start, end=s.end, text=s.text,

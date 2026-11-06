@@ -1,7 +1,7 @@
 """Word error rate of Whisper models and decoding options on reference clips.
 
-    python scripts/wer.py data/benchmark/clips --model-dir models/whisper-tiny.en --model-dir models/whisper-base \
-        --variant greedy --variant fallback_previous --language it
+    python scripts/wer.py data/benchmark/clips --model-dir models/whisper-tiny.en --model-dir models/whisper-base.en \
+        --variant greedy --variant fallback_previous
 
 CLIPS is a folder of audio files, each with a same-name .txt holding its correct transcript
 (clip01.mp3 + clip01.txt). The Benchmark tab saves its reference clips in exactly this form, in
@@ -27,7 +27,6 @@ def main() -> int:
     parser.add_argument("--model-dir", action="append", required=True, help="Repeat to compare models")
     parser.add_argument("--variant", action="append", choices=list(VARIANTS),
                         help="Decoding variant; repeat to compare (default: all)")
-    parser.add_argument("--language", default="auto", help="e.g. en, it, de; auto detects per clip")
     parser.add_argument("--initial-prompt", help="Vocabulary or style hint given to every window")
     parser.add_argument("--kv-cache", action="store_true", help="Decoder KV cache: same transcripts, faster")
     parser.add_argument("--threads", type=int, default=0)
@@ -39,7 +38,6 @@ def main() -> int:
         print(f"No audio files with a same-name .txt reference in {args.clips}", file=sys.stderr)
         return 1
     print(f"{len(clips)} clips from {args.clips}\n")
-    language = None if args.language == "auto" else args.language
     references = {c.id: c.reference for c in clips}
 
     rows = []
@@ -49,7 +47,7 @@ def main() -> int:
         load_s = time.perf_counter() - t0
         for variant in args.variant or list(VARIANTS):
             print(f"{model.name} · {VARIANTS[variant].label} …", flush=True)
-            result = evaluate(model, clips, language, variant_options(variant, args.initial_prompt, args.kv_cache))
+            result = evaluate(model, clips, variant_options(variant, args.initial_prompt, args.kv_cache))
             rows.append((model.name, VARIANTS[variant].label, result, load_s))
             if args.details:
                 for clip in sorted(result.clips, key=lambda c: c.wer, reverse=True)[:5]:

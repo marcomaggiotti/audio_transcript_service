@@ -27,6 +27,7 @@ from pathlib import Path
 import numpy as np
 
 from app.asr import DecodingOptions, Transcriber
+from app.models import is_multilingual
 from app.audio import SAMPLE_RATE, InvalidAudioError, decode_audio, duration_seconds
 from app.metrics import peak_memory_mb, reset_peak_memory
 from app.schemas import (
@@ -105,7 +106,7 @@ def clips_from_dir(directory: Path) -> list[EvalClip]:
     return clips
 
 
-def evaluate(transcriber: Transcriber, clips: list[EvalClip], language: str | None, options: DecodingOptions,
+def evaluate(transcriber: Transcriber, clips: list[EvalClip], options: DecodingOptions,
              on_clip: Callable[[int, EvalClip], None] | None = None, vad=None) -> BenchmarkResult:
     """Transcribe every clip and score it. WER is over all clips together (errors / reference words).
 
@@ -118,7 +119,7 @@ def evaluate(transcriber: Transcriber, clips: list[EvalClip], language: str | No
             on_clip(i, clip)
         audio = decode_audio(clip.path, as_int16=True)
         t0 = time.perf_counter()
-        hypothesis = transcribe_with(transcriber, audio, language, options=options, vad=vad).text
+        hypothesis = transcribe_with(transcriber, audio, options=options, vad=vad).text
         seconds = time.perf_counter() - t0
         score = word_error_rate(clip.reference, hypothesis)
         result.substitutions += score.substitutions
@@ -286,12 +287,13 @@ def cut_interval(path: Path, start: float, end: float, max_seconds: float) -> np
 
 
 def discover_models(models_dir: str) -> dict[str, Path]:
-    """Subdirectories holding a Whisper export (scripts/export_whisper_onnx.py), by directory name."""
+    """Subdirectories holding an English-only Whisper export (scripts/export_whisper_onnx.py), by directory name."""
     root = Path(models_dir)
     if not root.is_dir():
         return {}
     return {p.name: p for p in sorted(root.iterdir())
-            if p.is_dir() and (p / "encoder_model.onnx").exists() and (p / "tokenizer.json").exists()}
+            if p.is_dir() and (p / "encoder_model.onnx").exists() and (p / "tokenizer.json").exists()
+            and not is_multilingual(p)}
 
 
 def model_name(path: Path) -> str:
@@ -363,10 +365,9 @@ class BenchmarkRunner:
 
     def _run(self, run: BenchmarkRun, clips: list[EvalClip]) -> None:
         run.status, run.started_at = JobStatus.processing, utcnow()
-        language = None if run.language == "auto" else run.language
         try:
             for model_id in dict.fromkeys(run.models):
-                self._run_model(run, model_id, clips, language)
+                self._run_model(run, model_id, clips)
             run.status = JobStatus.completed
         except Exception as e:  # results so far are kept
             logger.exception("Benchmark %s failed", run.id)
@@ -377,7 +378,7 @@ class BenchmarkRunner:
             self.store.save_run(run)
             self.active.pop(run.id, None)
 
-    def _run_model(self, run: BenchmarkRun, model_id: str, clips: list[EvalClip], language: str | None) -> None:
+    def _run_model(self, run: BenchmarkRun, model_id: str, clips: list[EvalClip]) -> None:
         transcriber, load_seconds, error = None, None, None
         if self.default_model and model_id == self.default_model[0]:
             transcriber = self.default_model[1]
@@ -402,7 +403,7 @@ class BenchmarkRunner:
                         run.progress.current = f"{model_id} · {VARIANTS[variant].label} · {clip.name}"
 
                     try:
-                        result = evaluate(transcriber, clips, language, variant_options(variant, run.initial_prompt, run.kv_cache),
+                        result = evaluate(transcriber, clips, variant_options(variant, run.initial_prompt, run.kv_cache),
                                           on_clip=on_clip, vad=self.vad)
                     except (InvalidAudioError, ValueError, RuntimeError) as e:  # e.g. VAD not installed
                         result = BenchmarkResult(model=model_id, variant=variant, error=str(e))

@@ -22,8 +22,6 @@ class Settings(BaseModel):
 
     # Speech recognition (Whisper exported to ONNX, see scripts/export_whisper_onnx.py)
     whisper_model_dir: str = _env("WHISPER_MODEL_DIR", "./models/whisper-tiny.en")
-    # Used when a request doesn't specify one; "auto" detects the language from the first window.
-    default_language: str = _env("DEFAULT_LANGUAGE", "auto")
     max_new_tokens: int = int(_env("MAX_NEW_TOKENS", "224"))
     onnx_threads: int = int(_env("ONNX_THREADS", "0"))  # 0 = let ONNX Runtime decide
     # The CTranslate2 conversion of the same model (export --ct2), for jobs with engine=ctranslate2.
