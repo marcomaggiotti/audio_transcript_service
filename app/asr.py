@@ -510,7 +510,7 @@ class OnnxWhisperTranscriber:
 
         # An English-only model (whisper-*.en) has nothing to detect: its transcripts are English.
         return TranscriptionResult(language=(detected or language) if self.tokens.multilingual else "en",
-                                   segments=segments)
+                                   segments=segments, windows=windows)
 
     def detect_language(self, encoded: np.ndarray) -> str | None:
         if not self.tokens.multilingual:
