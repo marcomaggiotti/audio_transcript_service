@@ -42,8 +42,10 @@ services:
         - "**/*.md"
     envVars:
       # --- Speech model (also passed to the Docker build as a build arg) ---
+      # whisper-tiny.en: English only, more accurate on English than the multilingual whisper-tiny (same
+      # size). For other languages use openai/whisper-tiny, or pick whisper-small per job (EXTRA_MODELS).
       - key: WHISPER_MODEL
-        value: openai/whisper-tiny
+        value: openai/whisper-tiny.en
       # More models a job can choose (podcast-search: "Transcribe again" → Model), exported into the image,
       # space-separated. whisper-small is much better than tiny for Italian but needs ~1 GB while it
       # transcribes: on starter (512 MB) the service refuses it with that reason; it works on standard (2 GB).

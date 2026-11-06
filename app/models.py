@@ -68,7 +68,8 @@ def describe_export(path: Path, default: bool = False) -> ModelInfo:
             p for p in PRECISIONS if (path / f"{stem}.{p}.onnx").exists()})
     try:
         config = json.loads((path / "generation_config.json").read_text())
-        info.languages = [code.strip("<|>") for code in (config.get("lang_to_id") or {})] or ["en"]
+        multilingual = config.get("is_multilingual") is not False  # whisper-*.en say false
+        info.languages = [code.strip("<|>") for code in (config.get("lang_to_id") or {}) if multilingual] or ["en"]
     except (OSError, ValueError):
         info.languages = []
     return info

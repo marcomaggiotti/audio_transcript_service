@@ -1,6 +1,6 @@
 """Benchmark ONNX Whisper inference on this machine before promising latency numbers.
 
-    python scripts/benchmark.py path/to/audio.mp3 --model-dir models/whisper-tiny --runs 3
+    python scripts/benchmark.py path/to/audio.mp3 --model-dir models/whisper-tiny.en --runs 3
 
 Reports decode time, inference latency, real-time factor (inference / audio length;
 below 1.0 is faster than real time) and peak resident memory.
@@ -22,7 +22,7 @@ from app.metrics import peak_memory_mb  # noqa: E402
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("audio")
-    parser.add_argument("--model-dir", default="models/whisper-tiny")
+    parser.add_argument("--model-dir", default="models/whisper-tiny.en")
     parser.add_argument("--language", default="auto")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--threads", type=int, default=0)

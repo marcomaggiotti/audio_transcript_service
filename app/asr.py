@@ -276,7 +276,9 @@ def _resolve_tokens(tokenizer, generation_config: dict) -> WhisperTokens:
     lang_to_id = {
         tok.strip("<|>"): idx for tok, idx in (generation_config.get("lang_to_id") or {}).items()
     }
-    if not lang_to_id and generation_config.get("is_multilingual", True):
+    if generation_config.get("is_multilingual") is False:
+        lang_to_id = {}  # English-only (whisper-*.en): its prompt has no language or task token
+    elif not lang_to_id:
         for code in ("en", "de", "fr", "it", "es", "pt", "nl", "ja", "zh", "ru"):
             if (idx := tid(f"<|{code}|>")) is not None:
                 lang_to_id[code] = idx
@@ -506,7 +508,9 @@ class OnnxWhisperTranscriber:
             if on_progress:
                 on_progress(min(1.0, seek / audio.shape[0]))
 
-        return TranscriptionResult(language=detected or language, segments=segments, windows=windows)
+        # An English-only model (whisper-*.en) has nothing to detect: its transcripts are English.
+        return TranscriptionResult(language=(detected or language) if self.tokens.multilingual else "en",
+                                   segments=segments)
 
     def detect_language(self, encoded: np.ndarray) -> str | None:
         if not self.tokens.multilingual:

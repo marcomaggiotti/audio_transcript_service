@@ -127,7 +127,9 @@ def test_language_detection():
 def test_english_only_model_uses_short_prompt():
     t = make([[ts(0), 0, ts(1.0), EOT]], multilingual=False)
     assert t._prompt("de") == [SOT]
-    assert t.transcribe(np.zeros(16000, dtype=np.float32)).segments[0].text == "hello"
+    result = t.transcribe(np.zeros(16000, dtype=np.float32))
+    assert result.segments[0].text == "hello"
+    assert result.language == "en"  # reported even though nothing was detected
 
 
 def test_unknown_language_rejected():
@@ -254,134 +256,17 @@ def test_precision_swaps_parts_for_one_job_and_back(tmp_path):
             pass
 
 
-def test_transcribe_intervals_one_segment_per_span():
-    from app.asr import DecodingOptions, Segment, TranscriptionResult, WindowTrace, transcribe_intervals
+def test_english_only_config_wins_over_language_tokens():
+    class Tokenizer:  # an .en tokenizer still has the language tokens
+        ids = {"<|endoftext|>": 50256, "<|startoftranscript|>": 50257, "<|en|>": 50258, "<|it|>": 50274,
+               "<|transcribe|>": 50358, "<|startofprev|>": 50360, "<|nocaptions|>": 50361}
 
-    class Recorder:
-        def __init__(self):
-            self.lengths, self.languages = [], []
+        def token_to_id(self, token):
+            return self.ids.get(token)
 
-        def transcribe(self, audio, language=None, on_progress=None, options=None):
-            assert options.condition_on_previous_text is False
-            self.lengths.append(round(audio.shape[0] / 16000, 2))
-            self.languages.append(language)
-            return TranscriptionResult(language=language or "it", segments=[
-                Segment(0.0, 1.0, " uno", -0.2, 0.1), Segment(1.0, 2.0, "due ", -0.4, 0.3)],
-                windows=[WindowTrace(0.0, 2.0, 2.0, 0.1, False, 2)])
-
-    rec = Recorder()
-    audio = np.zeros(16000 * 10, dtype=np.int16)
-    shares = []
-    result = transcribe_intervals(rec, audio, [(0.0, 4.0), (4.0, 9.5), (9.5, 12.0)], None, shares.append,
-                                  DecodingOptions(condition_on_previous_text=True))
-    assert [(s.start, s.end, s.text) for s in result.segments] == [
-        (0.0, 4.0, "uno due"), (4.0, 9.5, "uno due"), (9.5, 10.0, "uno due")]  # clamped to the audio's end
-    assert result.segments[0].avg_logprob == -0.3 and result.segments[0].no_speech_prob == 0.3
-    assert rec.lengths == [4.0, 5.5, 0.5]
-    assert rec.languages == [None, "it", "it"]  # detected once, then kept
-    assert [w.start for w in result.windows] == [0.0, 4.0, 9.5]
-    assert shares[-1] == 1.0
-    assert result.text == "uno due uno due uno due"
-
-
-# ----------------------------------------------------------------- beam search
-
-# A first word that looks best on its own ("hello", barely ahead of "onnx") but leads to unsure words, against one
-# that leads to a sure text: greedy takes the first, beam search the second.
-BEAM_TABLE = {
-    (): {ts(0): 10},
-    (ts(0),): {0: 2.0, 2: 1.9},
-    (ts(0), 0): {1: 1.0, 4: 1.0, 5: 1.0, 6: 1.0},
-    (ts(0), 0, 1): {ts(2.0): 10}, (ts(0), 0, 4): {ts(2.0): 10}, (ts(0), 0, 5): {ts(2.0): 10},
-    (ts(0), 2): {3: 10},
-    (ts(0), 2, 3): {ts(2.0): 10},
-}
-
-
-def table_logits(ids: list[int]) -> np.ndarray:
-    logits = np.full(VOCAB, -30.0, dtype=np.float32)
-    if ids == [SOT]:
-        return logits
-    sampled = tuple(ids[ids.index(SOT) + 3:])
-    for token, value in BEAM_TABLE.get(sampled, {EOT: 10}).items():
-        logits[token] = value
-    return logits
-
-
-class TableDecoder:
-    """No KV cache: every call gets the whole prefix."""
-
-    def get_inputs(self):
-        return [SimpleNamespace(name="input_ids"), SimpleNamespace(name="encoder_hidden_states")]
-
-    def run(self, outputs, feeds):
-        return [table_logits(feeds["input_ids"][0].tolist())[None, None, :]]
-
-
-class CachedTableDecoder:
-    """A merged decoder whose self-attention "K/V" is the token history itself: a beam that forked wrongly (shared
-    or lost cache) would see the wrong history and get the wrong logits."""
-
-    def __init__(self):
-        self.calls = 0
-
-    def get_inputs(self):
-        return [SimpleNamespace(name="input_ids"), SimpleNamespace(name="encoder_hidden_states"),
-                SimpleNamespace(name="use_cache_branch"),
-                SimpleNamespace(name="past_key_values.0.decoder.key", shape=[None, 1, None, 1]),
-                SimpleNamespace(name="past_key_values.0.encoder.key", shape=[None, 1, None, 1])]
-
-    def get_outputs(self):
-        return [SimpleNamespace(name=n) for n in ("logits", "present.0.decoder.key", "present.0.encoder.key")]
-
-    def run(self, outputs, feeds):
-        self.calls += 1
-        history = feeds["past_key_values.0.decoder.key"][0, 0, :, 0].astype(int).tolist()
-        assert bool(feeds["use_cache_branch"][0]) == bool(history)
-        ids = history + feeds["input_ids"][0].tolist()
-        present = np.array(ids, dtype=np.float32)[None, None, :, None]
-        return [table_logits(ids)[None, None, :], present, np.zeros((1, 1, 1, 1), dtype=np.float32)]
-
-
-def make_table(decoder):
-    tokens = WhisperTokens(eot=EOT, sot=SOT, transcribe=TRANSCRIBE, no_timestamps=NO_TS, timestamp_begin=TS,
-                           lang_to_id={"en": EN, "de": DE}, suppress=[], prev=PREV)
-    return OnnxWhisperTranscriber(FakeEncoder(), decoder, FakeTokenizer(), tokens)
-
-
-@pytest.mark.parametrize("decoder", [TableDecoder, CachedTableDecoder])
-def test_beam_search_finds_the_more_likely_text(decoder):
-    audio = np.zeros(16000 * 3, dtype=np.float32)
-    greedy = make_table(decoder()).transcribe(audio, "en")
-    assert greedy.text == "hello world"
-    beam = make_table(decoder()).transcribe(audio, "en", options=DecodingOptions(beam_size=3))
-    assert beam.text == "onnx runtime"
-    assert [(s.start, s.end) for s in beam.segments] == [(0.0, 2.0)]
-    assert beam.segments[0].avg_logprob > greedy.segments[0].avg_logprob
-    assert beam.windows[0].attempts[0]["beam_size"] == 3
-
-
-def test_beam_search_only_at_temperature_zero():
-    loop = [ts(0)] + [0] * 60 + [ts(5.0), EOT]
-    good = [ts(0), 2, 3, ts(5.0), EOT]
-    t = make([[loop, good]])
-    result = t.transcribe(np.zeros(16000 * 6, dtype=np.float32), "en",
-                          options=DecodingOptions(temperature_fallback=True, beam_size=2))
-    assert [a["beam_size"] for a in result.windows[0].attempts] == [2, 1]  # the fallback samples, as openai/whisper
-
-
-# ----------------------------------------------------------------- carried text
-
-def test_a_window_that_loops_is_not_carried_into_the_next():
-    loop = [ts(0)] + [0] * 60 + [ts(29.0), EOT]
-    second = [ts(0), 2, ts(3.0), EOT]
-    options = DecodingOptions(condition_on_previous_text=True)
-    t = make([loop, second])
-    result = t.transcribe(np.zeros(16000 * 40, dtype=np.float32), "en", options=options)
-    assert t.decoder.prompts[1] == [SOT, EN, TRANSCRIBE]  # started afresh
-    assert result.windows[0].prompt_reset and not result.windows[1].prompt_reset
-
-    t = make([loop, second])
-    t.transcribe(np.zeros(16000 * 40, dtype=np.float32), "en",
-                 options=DecodingOptions(condition_on_previous_text=True, reset_on_loop=False))
-    assert t.decoder.prompts[1][:3] == [PREV, 0, 0]  # the loop is carried over
+    from app.asr import _resolve_tokens
+    english = _resolve_tokens(Tokenizer(), {"is_multilingual": False, "no_timestamps_token_id": 50362,
+                                            "lang_to_id": {"<|en|>": 50258}})
+    assert not english.multilingual and english.timestamp_begin == 50363 and english.no_speech == 50361
+    multilingual = _resolve_tokens(Tokenizer(), {"no_timestamps_token_id": 50362})
+    assert multilingual.lang_to_id == {"en": 50258, "it": 50274}

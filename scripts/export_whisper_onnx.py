@@ -1,7 +1,7 @@
 """Export a Whisper checkpoint to ONNX in the layout app/asr.py expects.
 
     pip install -r requirements-export.txt
-    python scripts/export_whisper_onnx.py --model openai/whisper-tiny --output models/whisper-tiny
+    python scripts/export_whisper_onnx.py --model openai/whisper-tiny.en --output models/whisper-tiny.en
 
 Only needed once, at build time; the API itself needs just ONNX Runtime.
 
@@ -237,9 +237,9 @@ def smoke_test(output: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--model", default="openai/whisper-tiny",
-                        help="Hugging Face model id, e.g. openai/whisper-base or openai/whisper-tiny.en")
-    parser.add_argument("--output", default="models/whisper-tiny")
+    parser.add_argument("--model", default="openai/whisper-tiny.en",
+                        help="Hugging Face model id, e.g. openai/whisper-tiny (multilingual) or openai/whisper-base.en")
+    parser.add_argument("--output", default="models/whisper-tiny.en")
     parser.add_argument("--quantize", choices=["decoder", "all", "none"], default="decoder",
                         help="INT8 weights for: the decoder only (default), encoder and decoder (smaller, but "
                              "garbles real speech), or nothing")
