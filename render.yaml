@@ -70,10 +70,11 @@ services:
         value: "true"
       - key: CONDITION_ON_PREVIOUS_TEXT
         value: "false"
-      # Decoder KV cache: a speed-up only, the same transcript. Off for now (the slow path); "true" is several
-      # times faster.
+      # Decoder KV cache: a speed-up only, the same transcript. "false" re-runs the decoder over the whole text at
+      # every step (about 10x the decoder work, times the beams with beam search): on 0.5 CPU a 2-minute recording
+      # with beam 5 took over 12 minutes and held up the queue.
       - key: KV_CACHE
-        value: "false"
+        value: "true"
 
       # --- Access control ---
       - key: API_TOKEN

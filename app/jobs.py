@@ -14,7 +14,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 
-from app.asr import DecodingOptions, Transcriber
+from app.asr import Cancelled, DecodingOptions, Transcriber, cancel_check
 from app.audio import InvalidAudioError, decode_audio, duration_seconds
 from app.ct2 import CT2Engine
 from app.metrics import peak_memory_mb, reset_peak_memory
@@ -53,6 +53,7 @@ class TranscriptionService:
         self.jobs: OrderedDict[str, Job] = OrderedDict()
         self._finished: dict[str, asyncio.Event] = {}
         self._tasks: dict[str, Callable[[], None]] = {}  # queued work that isn't a transcription job
+        self._cancelled: set[str] = set()  # running jobs deleted: they stop at their next decoder step
         self._workers: list[asyncio.Task] = []
         self.active = 0  # jobs currently being transcribed
 
@@ -113,8 +114,11 @@ class TranscriptionService:
         return list(reversed(self.jobs.values()))
 
     def delete(self, job_id: str) -> None:
-        """Forget a job; a queued one is skipped, a running one finishes and is discarded."""
-        self.get(job_id)
+        """Forget a job. A queued one is skipped; a running one stops at its next decoder step (CTranslate2: its next
+        segment), so the worker moves on to the next job instead of finishing work nobody will read."""
+        job = self.get(job_id)
+        if job.status == JobStatus.processing:
+            self._cancelled.add(job_id)
         del self.jobs[job_id]
         self._finished.pop(job_id, None)
         self.upload_path(job_id).unlink(missing_ok=True)
@@ -172,6 +176,23 @@ class TranscriptionService:
         job.status, job.started_at, job.stage = JobStatus.processing, utcnow(), "decoding"
         path = self.upload_path(job_id)
         reset_peak_memory()  # the peak reported is this job's (Linux), not the largest one so far
+
+        def check() -> None:
+            if job_id in self._cancelled:
+                raise Cancelled(f"Job {job_id} was cancelled")
+
+        token = cancel_check.set(check)  # this worker thread only: checked before every decoder step
+        try:
+            self._process(job, path, check)
+        except Cancelled:
+            logger.info("Stopped cancelled job %s", job_id)
+            path.unlink(missing_ok=True)
+        finally:
+            cancel_check.reset(token)
+            self._cancelled.discard(job_id)
+
+    def _process(self, job: Job, path, check: Callable[[], None]) -> None:
+        job_id = job.id
         try:
             if self.transcriber is None:
                 raise RuntimeError(f"Speech model unavailable: {self.transcriber_error or 'not loaded'}")
@@ -186,6 +207,7 @@ class TranscriptionService:
             job.stage = "transcribing"
 
             def progress(share: float) -> None:
+                check()  # also stops the CTranslate2 engine, between segments
                 job.progress = round(share, 3)
 
             options = DecodingOptions(temperature_fallback=job.temperature_fallback,
@@ -209,6 +231,8 @@ class TranscriptionService:
             else:
                 result, t_load, weights_mb = self._onnx(job, audio, options, progress, loading)
             t2 = time.perf_counter()
+        except Cancelled:
+            raise
         except Exception as e:
             logger.exception("Transcription failed for %s", job_id)
             job.error = str(e) or e.__class__.__name__

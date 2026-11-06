@@ -241,3 +241,45 @@ def test_bad_intervals_are_refused(client, transcriber, intervals):
     response = upload(client, data={"intervals": intervals})
     assert response.status_code == 422
     assert transcriber.calls == 0
+
+
+class SpinningTranscriber(FakeTranscriber):
+    """Decodes "forever" (10 s), checking for cancellation the way the real decoder does before each step."""
+
+    def __init__(self):
+        super().__init__()
+        self.started = threading.Event()
+        self.stopped = threading.Event()
+
+    def transcribe(self, audio, language=None, on_progress=None, options=None):
+        from app.asr import Cancelled, check_cancelled
+
+        if self.calls:  # every job after the first is quick
+            return super().transcribe(audio, language, on_progress, options)
+        self.calls += 1
+        self.started.set()
+        deadline = time.monotonic() + 10
+        try:
+            while time.monotonic() < deadline:
+                check_cancelled()
+                time.sleep(0.01)
+        except Cancelled:
+            self.stopped.set()
+            raise
+        return super().transcribe(audio, language, on_progress, options)
+
+
+def test_deleting_a_running_job_stops_it_and_frees_the_worker(settings):
+    transcriber = SpinningTranscriber()
+    with TestClient(create_app(settings, Components(transcriber=transcriber))) as client:
+        stuck = upload(client).json()
+        assert transcriber.started.wait(5)
+        waiting = upload(client).json()  # queued behind it, like a "Stop and restart"
+        assert client.get(f"/jobs/{waiting['id']}").json()["queue_position"] == 0
+
+        t0 = time.monotonic()
+        assert client.delete(f"/jobs/{stuck['id']}").status_code == 204
+        assert transcriber.stopped.wait(2)
+        assert wait_for(client, waiting["id"])["status"] == "completed"
+        assert time.monotonic() - t0 < 3  # not the 10 s the first job would have taken
+        assert client.get(f"/jobs/{stuck['id']}").status_code == 404

@@ -317,3 +317,25 @@ def test_kv_cache_changes_the_work_not_the_transcript(beam_size):
     # Cached: after the prompt, one new token per call. Off: always the first-call branch, with the whole text.
     assert all(n == 1 for cached, n in calls[True] if cached) and any(cached for cached, _ in calls[True])
     assert not any(cached for cached, _ in calls[False]) and max(n for _, n in calls[False]) > 5
+
+
+def test_cancel_check_stops_decoding_between_steps():
+    from app.asr import Cancelled, cancel_check
+
+    t = make([[ts(0)] + [0] * 100 + [ts(5.0), EOT]])
+    steps = []
+
+    def check():
+        steps.append(1)
+        if len(steps) > 5:
+            raise Cancelled("stop")
+
+    token = cancel_check.set(check)
+    try:
+        with pytest.raises(Cancelled):
+            t.transcribe(np.zeros(16000 * 6, dtype=np.float32), "en")
+    finally:
+        cancel_check.reset(token)
+    assert len(steps) == 6  # checked before each decoder step, stopped at the first one after cancelling
+    fresh = make([[ts(0)] + [0] * 100 + [ts(5.0), EOT]])
+    assert fresh.transcribe(np.zeros(16000 * 6, dtype=np.float32), "en").segments  # no check set: runs to the end

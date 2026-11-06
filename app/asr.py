@@ -24,6 +24,7 @@ import os
 import zlib
 from collections.abc import Callable
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Protocol
@@ -39,6 +40,22 @@ from app.features import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+
+class Cancelled(RuntimeError):
+    """Raised inside a transcription whose job was cancelled (DELETE /jobs/{id})."""
+
+
+# Set by the job worker around a transcription, in its own thread: called before every decoder step, it raises
+# Cancelled once the job is cancelled, so a stopped job frees the CPU within a step instead of running to the end.
+cancel_check: ContextVar[Callable[[], None] | None] = ContextVar("cancel_check", default=None)
+
+
+def check_cancelled() -> None:
+    if (check := cancel_check.get()) is not None:
+        check()
+
 
 TIME_PRECISION = 0.02  # seconds per timestamp token
 MAX_INITIAL_TIMESTAMP = 1.0  # first segment must start within 1 s of the window
@@ -65,8 +82,9 @@ class DecodingOptions:
     beam_size: int = 1  # 1 = greedy; more keeps that many candidate texts at temperature 0 (openai/whisper: 5)
     reset_on_loop: bool = True  # don't prompt the next window with a window whose text repeats itself
     # Keep the decoder's keys/values of the tokens already written, so each step computes only the new one.
-    # Off: every step recomputes them from the whole text so far, which gives the same tokens, slower (a few
-    # times, for long windows). It is a speed-up only: the tokens Whisper conditions on are the same either way.
+    # Off: every step recomputes them from the whole text so far, and the cross-attention keys/values of all
+    # 1500 encoder frames too: the same tokens, about 10x the decoder work (times the beams with beam search).
+    # It is a speed-up only: the tokens Whisper conditions on are the same either way.
     kv_cache: bool = True
     # Voice activity detection (app/vad.py): Whisper hears only the speech, cut at pauses into pieces up to 30 s.
     vad: bool = False
@@ -175,6 +193,7 @@ class _PrefixSession:
         self.decoder, self.encoded, self.feeds = decoder, encoded, feeds or {}
 
     def __call__(self, tokens: list[int]) -> np.ndarray:
+        check_cancelled()
         logits = self.decoder.run(["logits"], {"input_ids": np.array([tokens], dtype=np.int64),
                                                "encoder_hidden_states": self.encoded, **self.feeds})[0]
         return logits[0, -1].astype(np.float32)
@@ -193,6 +212,7 @@ class _CachedSession:
         self.decoder, self.outputs, self.encoded, self.past, self.fed = decoder, outputs, encoded, past, fed
 
     def __call__(self, tokens: list[int]) -> np.ndarray:
+        check_cancelled()
         first = self.fed == 0
         outputs = self.decoder.run(None, {
             "input_ids": np.array([tokens[self.fed:]], dtype=np.int64),
