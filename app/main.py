@@ -254,7 +254,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
                    intervals: list[tuple[float, float]] | None = None, beam_size: int | None = None,
                    reset_on_loop: bool | None = None, vad: bool | None = None, vad_threshold: float | None = None,
                    vad_min_silence_ms: int | None = None, engine: str | None = None,
-                   compute_type: str | None = None) -> Job:
+                   compute_type: str | None = None, kv_cache: bool | None = None) -> Job:
         """Queue the audio at service.upload_path(job_id), with the default decoding options unless given."""
         job = Job(
             id=job_id, filename=filename, size_bytes=size, language=None if language == "auto" else language,
@@ -272,6 +272,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
             vad_threshold=settings.vad_threshold if vad_threshold is None else vad_threshold,
             vad_min_silence_ms=settings.vad_min_silence_ms if vad_min_silence_ms is None else vad_min_silence_ms,
             engine=engine or "onnx", compute_type=compute_type if engine == "ctranslate2" else None,
+            kv_cache=settings.kv_cache if kv_cache is None else kv_cache,
         )
         if job.vad and service.vad is None and job.engine == "onnx":  # CTranslate2 has its own (faster-whisper's)
             raise HTTPException(503, "Voice activity detection is unavailable on this service: "
@@ -364,6 +365,9 @@ def create_app(settings: Settings | None = None, components: Components | None =
                                                                   "is speech (default: VAD_THRESHOLD, 0.5)")
     vad_silence_param = Form(None, ge=100, le=5000, description="VAD: a pause at least this long (ms) ends a stretch "
                                                                 "of speech (default: VAD_MIN_SILENCE_MS, 500)")
+    kv_cache_param = Form(None, description="The decoder's KV cache: keep each step's keys and values and feed only the "
+                                            "new token (fast). false: re-run the whole prefix every step, same text, "
+                                            "slower; for comparison. CTranslate2 always uses it (default: KV_CACHE, true)")
     engine_param = Form(None, pattern=r"^(onnx|ctranslate2)$",
                         description="Inference engine: onnx (ONNX Runtime, default) or ctranslate2 (the same model on "
                                     "CTranslate2 through faster-whisper; see GET /config engines)")
@@ -386,7 +390,8 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          reset_on_loop: bool | None = reset_param, vad: bool | None = vad_param,
                          vad_threshold: float | None = vad_threshold_param,
                          vad_min_silence_ms: int | None = vad_silence_param,
-                         engine: str | None = engine_param, compute_type: str | None = compute_type_param):
+                         engine: str | None = engine_param, compute_type: str | None = compute_type_param,
+                         kv_cache: bool | None = kv_cache_param):
         """Upload audio and wait for its transcript. Shares the job queue, so it waits its turn."""
         service = service_of(request)
         job = await accept_upload(service, file, language, temperature_fallback=temperature_fallback,
@@ -394,7 +399,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
                                   initial_prompt=initial_prompt, encoder=encoder, decoder=decoder, model=model,
                                   intervals=intervals, beam_size=beam_size, reset_on_loop=reset_on_loop, vad=vad,
                                   vad_threshold=vad_threshold, vad_min_silence_ms=vad_min_silence_ms,
-                                  engine=engine, compute_type=compute_type)
+                                  engine=engine, compute_type=compute_type, kv_cache=kv_cache)
         try:
             job = await service.wait(job.id)
         finally:
@@ -416,7 +421,8 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          reset_on_loop: bool | None = reset_param, vad: bool | None = vad_param,
                          vad_threshold: float | None = vad_threshold_param,
                          vad_min_silence_ms: int | None = vad_silence_param,
-                         engine: str | None = engine_param, compute_type: str | None = compute_type_param):
+                         engine: str | None = engine_param, compute_type: str | None = compute_type_param,
+                         kv_cache: bool | None = kv_cache_param):
         """Upload audio for background transcription; poll the status URL, then fetch the transcript.
 
         `model` picks the speech model and `encoder` / `decoder` the precision of each part for this job (see
@@ -426,7 +432,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
                                   initial_prompt=initial_prompt, encoder=encoder, decoder=decoder, model=model,
                                   intervals=intervals, beam_size=beam_size, reset_on_loop=reset_on_loop, vad=vad,
                                   vad_threshold=vad_threshold, vad_min_silence_ms=vad_min_silence_ms,
-                                  engine=engine, compute_type=compute_type)
+                                  engine=engine, compute_type=compute_type, kv_cache=kv_cache)
         return summary(job)
 
     @app.get("/jobs", response_model=list[JobSummary])
@@ -689,6 +695,10 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          "initial_prompt": settings.initial_prompt,
                          "beam_size": settings.beam_size, "max_beam_size": asr.MAX_BEAM_SIZE,
                          "reset_prompt_on_loop": settings.reset_prompt_on_loop,
+                         "kv_cache": {"default": settings.kv_cache,
+                                      "available": bool(getattr(t, "kv_cache_available", False)),
+                                      "description": "Keep the decoder's keys and values between steps: one new "
+                                                     "token per decoder call instead of the whole prefix"},
                          "vad": {"default": settings.vad, "available": service.vad is not None,
                                  "error": service.vad_error, "model": "Silero VAD v5 (ONNX)",
                                  "threshold": settings.vad_threshold,

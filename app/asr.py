@@ -68,6 +68,9 @@ class DecodingOptions:
     vad: bool = False
     vad_threshold: float = 0.5  # speech probability above which a 32 ms frame is speech
     vad_min_silence_ms: int = 500  # a pause at least this long ends a stretch of speech
+    # The decoder's KV cache: keep each step's self-attention keys and values and feed only the new token. Off, every
+    # step re-runs the whole prefix (same text, slower: for comparison). Exports without a merged decoder never have it.
+    kv_cache: bool = True
 
 
 @dataclass
@@ -174,6 +177,23 @@ class _PrefixSession:
         return logits[0, -1].astype(np.float32)
 
     def fork(self) -> "_PrefixSession":
+        return self
+
+
+class _UncachedSession:
+    """Merged decoder with its KV cache off: every step takes the first-call branch with the whole prefix and no past,
+    so nothing is kept between steps (what _CachedSession saves, measured)."""
+
+    def __init__(self, decoder, outputs: list[str], encoded: np.ndarray, empty_past: dict):
+        self.decoder, self.outputs, self.encoded, self.empty_past = decoder, outputs, encoded, empty_past
+
+    def __call__(self, tokens: list[int]) -> np.ndarray:
+        outputs = self.decoder.run(None, {"input_ids": np.array([tokens], dtype=np.int64),
+                                          "encoder_hidden_states": self.encoded,
+                                          "use_cache_branch": np.array([False]), **self.empty_past})
+        return outputs[self.outputs.index("logits")][0, -1].astype(np.float32)
+
+    def fork(self) -> "_UncachedSession":
         return self
 
 
@@ -554,15 +574,23 @@ class OnnxWhisperTranscriber:
     def _next_logits(self, tokens: list[int], encoded: np.ndarray) -> np.ndarray:
         return self._decoder_session(encoded)(tokens)
 
-    def _decoder_session(self, encoded: np.ndarray):
+    @property
+    def kv_cache_available(self) -> bool:
+        """Whether this export's decoder has a KV cache (the merged decoder); legacy exports re-run the prefix."""
+        return self._kv_cache
+
+    def _decoder_session(self, encoded: np.ndarray, kv_cache: bool = True):
         """Return step(tokens) -> logits for the next token, for one window.
 
-        With the merged decoder, step() feeds only the tokens added since the previous call and keeps the
-        self-attention K/V in between; the cross-attention K/V (from encoded) are computed on the first call.
+        With the merged decoder and `kv_cache`, step() feeds only the tokens added since the previous call and keeps
+        the self-attention K/V in between; the cross-attention K/V (from encoded) are computed on the first call.
+        Without `kv_cache`, every step feeds the whole prefix and keeps nothing.
         """
         if not self._kv_cache:
             return _PrefixSession(self.decoder, encoded)
         past = {name: np.zeros(shape, dtype=np.float32) for name, shape in self._empty_past.items()}
+        if not kv_cache:
+            return _UncachedSession(self.decoder, self._decoder_outputs, encoded, past)
         return _CachedSession(self.decoder, self._decoder_outputs, encoded, past, 0)
 
     def _decode_with_fallback(self, encoded: np.ndarray, language: str | None, window_seconds: float,
@@ -572,7 +600,7 @@ class OnnxWhisperTranscriber:
         tried: list[dict] = []
         for temperature in temperatures:
             result = self._decode_window(encoded, language, window_seconds, previous, temperature, rng,
-                                         beam_size=options.beam_size)
+                                         beam_size=options.beam_size, kv_cache=options.kv_cache)
             tried.append({"temperature": temperature, "compression_ratio": round(result.compression_ratio, 3),
                           "avg_logprob": round(result.avg_logprob, 4),
                           "beam_size": options.beam_size if temperature == 0 and options.beam_size > 1 else 1})
@@ -585,14 +613,15 @@ class OnnxWhisperTranscriber:
 
     def _decode_window(self, encoded: np.ndarray, language: str | None, window_seconds: float,
                        previous: list[int] | None = None, temperature: float = 0.0,
-                       rng: np.random.Generator | None = None, beam_size: int = 1) -> WindowResult:
+                       rng: np.random.Generator | None = None, beam_size: int = 1,
+                       kv_cache: bool = True) -> WindowResult:
         """Decode one 30 s window: greedy (or beam search) at temperature 0, otherwise sampled."""
         prompt = self._prompt(language, previous)
         steps = min(self.max_new_tokens, N_TEXT_CTX - len(prompt))
         if temperature == 0 and beam_size > 1:
-            sampled, logprobs = self._beam_search(encoded, prompt, steps, beam_size)
+            sampled, logprobs = self._beam_search(encoded, prompt, steps, beam_size, kv_cache)
         else:
-            sampled, logprobs = self._sample(encoded, prompt, steps, temperature, rng)
+            sampled, logprobs = self._sample(encoded, prompt, steps, temperature, rng, kv_cache)
         segments, consumed = self._split_segments(sampled, window_seconds, logprobs)
         text = self._decode_text([t for t in sampled if t < self.tokens.eot]).encode()
         return WindowResult(
@@ -604,12 +633,12 @@ class OnnxWhisperTranscriber:
         )
 
     def _sample(self, encoded: np.ndarray, prompt: list[int], steps: int, temperature: float,
-                rng: np.random.Generator | None) -> tuple[list[int], list[float]]:
+                rng: np.random.Generator | None, kv_cache: bool = True) -> tuple[list[int], list[float]]:
         """One token at a time: the most likely (temperature 0) or a sampled one. Returns the tokens after the
         prompt and the log-probability of each, after the filters (as Whisper scores them)."""
         tokens = list(prompt)
         logprobs: list[float] = []
-        next_logits = self._decoder_session(encoded)
+        next_logits = self._decoder_session(encoded, kv_cache)
         for _ in range(steps):
             logits = next_logits(tokens)
             self._apply_rules(logits, tokens[len(prompt):])
@@ -627,14 +656,14 @@ class OnnxWhisperTranscriber:
         return tokens[len(prompt):], logprobs
 
     def _beam_search(self, encoded: np.ndarray, prompt: list[int], steps: int,
-                     beam_size: int) -> tuple[list[int], list[float]]:
+                     beam_size: int, kv_cache: bool = True) -> tuple[list[int], list[float]]:
         """openai/whisper's beam search: keep the `beam_size` most likely texts so far; each step every one is
         extended by its most likely next tokens and the best `beam_size` of all those are kept. A text that ends
         (<|endoftext|>) while ranking above the last one kept is set aside, until `beam_size` have ended. The winner has the best mean log-probability
         per token (longer texts aren't penalized for being longer)."""
         eot = self.tokens.eot
         # (sampled tokens, their log-probabilities, sum, decoder session holding the K/V of prompt + sampled)
-        beams = [([], [], 0.0, self._decoder_session(encoded))]
+        beams = [([], [], 0.0, self._decoder_session(encoded, kv_cache))]
         finished: list[tuple[list[int], list[float], float]] = []
         for _ in range(steps):
             candidates = []

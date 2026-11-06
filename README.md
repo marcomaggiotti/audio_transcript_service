@@ -38,7 +38,7 @@ multilingual `openai/whisper-tiny` of the same size. For other languages, pick `
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/transcribe?format=json\|text\|srt\|vtt` | Multipart `file` (WAV, MP3, OGG/Opus, M4A, FLAC) and optional `language` (`en`, `de`, `it`, … or `auto`), `temperature_fallback`, `condition_on_previous_text`, `reset_on_loop`, `vad` (`true`/`false`), `vad_threshold`, `vad_min_silence_ms`, `beam_size`, `initial_prompt` and `intervals`. Waits and returns the transcript |
+| `POST` | `/transcribe?format=json\|text\|srt\|vtt` | Multipart `file` (WAV, MP3, OGG/Opus, M4A, FLAC) and optional `language` (`en`, `de`, `it`, … or `auto`), `temperature_fallback`, `condition_on_previous_text`, `reset_on_loop`, `vad` (`true`/`false`), `vad_threshold`, `vad_min_silence_ms`, `beam_size`, `kv_cache`, `initial_prompt` and `intervals`. Waits and returns the transcript |
 | `POST` | `/jobs` | Same upload, transcribed in the background. Returns `202` with the job id, `status_url` and `transcript_url` |
 | `GET` | `/jobs` | Recent jobs, newest first |
 | `GET` | `/jobs/{id}` | Status, `stage` (decoding, transcribing), `progress` (0–1, updated after each 30 s window), `queue_position` while queued, model, timings and metrics, or the error if it failed |
@@ -103,6 +103,12 @@ options follow openai/whisper:
   many candidate texts in parallel and picks the one with the best mean log-probability per token, as openai/whisper
   does with 5. Usually noticeably fewer word errors, more so on a weak model; the decoder is about 3-5x slower (the
   encoder is unchanged). Fallback attempts at higher temperatures still sample one text.
+- **KV cache** (`KV_CACHE`, `kv_cache`, on by default): the merged decoder keeps each step's self-attention keys
+  and values, and the encoder's cross-attention ones from the first step, so every decoder call feeds only the new
+  token. Off, every step re-runs the whole prefix (prompt and text so far) through the decoder: the same text, a
+  slower decoder, more so on long windows and with beam search. It's there to measure what the cache saves; the job's
+  `metrics.kv_cache` says whether it was used. CTranslate2 always decodes with its cache, and an export with only
+  `decoder_model.onnx` (no merged decoder) never has one; `GET /config` (`decoding.kv_cache.available`) says which.
 - **Voice activity detection** (`VAD`, `vad`, off by default; `vad_threshold`, `vad_min_silence_ms`): Silero VAD
   (MIT licence, a 2 MB ONNX model at `VAD_MODEL_PATH`, put in the image by the Dockerfile) gives each 32 ms of audio
   a speech probability. Stretches of speech (padded by 200 ms, ended by a pause of at least `vad_min_silence_ms`,
@@ -301,6 +307,7 @@ pytest
 | `TEMPERATURE_FALLBACK` / `CONDITION_ON_PREVIOUS_TEXT` | `true` / `true` | Decoding defaults; requests can override them |
 | `BEAM_SIZE` / `RESET_PROMPT_ON_LOOP` | `1` / `true` | Beam search width (1 = greedy); stop carrying text after a loop |
 | `VAD` / `VAD_THRESHOLD` / `VAD_MIN_SILENCE_MS` | `false` / `0.5` / `500` | Voice activity detection defaults; requests can override them |
+| `KV_CACHE` | `true` | The decoder's KV cache (one new token per step); `false` re-runs the whole prefix every step. Requests can override it (`kv_cache`) |
 | `VAD_MODEL_PATH` | `./models/vad/silero_vad.onnx` | Silero VAD model (the Docker image has it) |
 | `INITIAL_PROMPT` | – | Default initial prompt (names, terms) |
 | `MODELS_DIR` | `./models` | Exports jobs can choose (`model=`) and the benchmark can compare |

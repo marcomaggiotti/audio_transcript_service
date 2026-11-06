@@ -43,6 +43,8 @@ class InferenceMetrics(BaseModel):
     load_seconds: float | None = Field(None, description="Loading the requested model, when it isn't the service's")
     engine: str = Field("onnx", description="The inference engine that ran: onnx or ctranslate2")
     model_mb: float | None = Field(None, description="Size of the weights it ran with (the files of the precisions used)")
+    kv_cache: bool | None = Field(None, description="Whether the decoder ran with its KV cache (CTranslate2 always "
+                                                    "does; an export without a merged decoder never does)")
 
 
 class WindowAttempt(BaseModel):
@@ -97,6 +99,8 @@ class Job(BaseModel):
     vad: bool = Field(False, description="Transcribe only the speech voice activity detection finds")
     vad_threshold: float = Field(0.5, description="Speech probability above which a 32 ms frame is speech")
     vad_min_silence_ms: int = Field(500, description="A pause at least this long ends a stretch of speech")
+    kv_cache: bool = Field(True, description="Reuse the decoder's keys and values between steps (off: re-run the "
+                                             "whole prefix every step)")
     intervals: list[tuple[float, float]] | None = Field(
         None, description="Transcribe only these [start, end] spans, each on its own: one segment per span")
     precision: dict[str, str] | None = Field(None, description="Precision actually used: {encoder, decoder}")

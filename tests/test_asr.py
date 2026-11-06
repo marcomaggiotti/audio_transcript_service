@@ -270,3 +270,57 @@ def test_english_only_config_wins_over_language_tokens():
     assert not english.multilingual and english.timestamp_begin == 50363 and english.no_speech == 50361
     multilingual = _resolve_tokens(Tokenizer(), {"no_timestamps_token_id": 50362})
     assert multilingual.lang_to_id == {"en": 50258, "it": 50274}
+
+
+class MergedDecoder(ScriptedDecoder):
+    """optimum's merged decoder: use_cache_branch picks the cached branch, which reads past_key_values. Here the
+    "keys" carry the token ids fed so far, so the scripted logits see the whole sequence either way."""
+
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self.fed: list[int] = []  # tokens fed per decoder call
+
+    def get_inputs(self):
+        return super().get_inputs() + [SimpleNamespace(name="use_cache_branch", shape=[1]),
+                                       SimpleNamespace(name="past_key_values.0.decoder.key", shape=[1, 1, "seq", 1])]
+
+    def get_outputs(self):
+        return [SimpleNamespace(name="logits"), SimpleNamespace(name="present.0.decoder.key")]
+
+    def run(self, outputs, feeds):
+        new = feeds["input_ids"][0].tolist()
+        self.fed.append(len(new))
+        cached = bool(feeds["use_cache_branch"][0])
+        ids = (feeds["past_key_values.0.decoder.key"][0, 0, :, 0].astype(int).tolist() if cached else []) + new
+        [logits] = super().run(["logits"], {"input_ids": np.array([ids]),
+                                            "encoder_hidden_states": feeds["encoder_hidden_states"]})
+        return [logits, np.array(ids, dtype=np.float32).reshape(1, 1, -1, 1)]
+
+
+def make_merged(scripts):
+    tokens = WhisperTokens(eot=EOT, sot=SOT, transcribe=TRANSCRIBE, no_timestamps=NO_TS, timestamp_begin=TS,
+                           lang_to_id={"en": EN, "de": DE}, suppress=[], prev=PREV)
+    return OnnxWhisperTranscriber(FakeEncoder(), MergedDecoder(scripts), FakeTokenizer(), tokens)
+
+
+@pytest.mark.parametrize("beam_size", [1, 3])
+def test_the_kv_cache_feeds_one_token_per_step_and_off_the_whole_prefix(beam_size):
+    script = [ts(0), 0, 1, ts(2.0), EOT]
+    audio = np.zeros(16000 * 3, dtype=np.float32)
+    runs = {}
+    for kv_cache in (True, False):
+        t = make_merged([script])
+        result = t.transcribe(audio, "en", options=DecodingOptions(kv_cache=kv_cache, beam_size=beam_size))
+        runs[kv_cache] = ([(s.start, s.end, s.text) for s in result.segments], t.decoder.fed)
+    assert t.kv_cache_available
+    assert runs[True][0] == runs[False][0] == [(0.0, 2.0, "hello world")]  # the same text either way
+    on, off = runs[True][1], runs[False][1]
+    assert on[0] == off[0] == 1  # <|startoftranscript|>: language and no-speech
+    assert on[1] == 3 and set(on[2:]) == {1}  # the prompt once, then only the new token
+    if beam_size == 1:
+        assert off[1:] == [3, 4, 5, 6, 7]  # every step re-feeds the whole prefix
+    assert sum(off) > sum(on)
+
+
+def test_a_legacy_export_has_no_kv_cache():
+    assert not make([[EOT]]).kv_cache_available  # decoder_model.onnx: no past inputs
