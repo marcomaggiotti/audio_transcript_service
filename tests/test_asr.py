@@ -292,6 +292,11 @@ class MergedDecoder(ScriptedDecoder):
         return [produced[name] for name in (outputs or [o.name for o in self.get_outputs()])]
 
 
+def make_merged(scripts, **kw):
+    """A transcriber on the merged-decoder stand-in, so it has a KV cache to use or not."""
+    return OnnxWhisperTranscriber(FakeEncoder(), MergedDecoder(scripts, **kw), FakeTokenizer(), make([]).tokens)
+
+
 @pytest.mark.parametrize("beam_size", [1, 3])
 def test_kv_cache_changes_the_work_not_the_transcript(beam_size):
     scripts = [[ts(0), 0, 1, ts(2.0), ts(2.0), 2, 3, ts(29.0), EOT], [ts(1.0), 4, ts(3.0), EOT]]
@@ -300,6 +305,7 @@ def test_kv_cache_changes_the_work_not_the_transcript(beam_size):
     for kv_cache in (True, False):
         decoder = MergedDecoder(scripts)
         t = OnnxWhisperTranscriber(FakeEncoder(), decoder, FakeTokenizer(), make([]).tokens)
+        assert t.kv_cache_available
         result = t.transcribe(audio, options=DecodingOptions(kv_cache=kv_cache, beam_size=beam_size,
                                                                    condition_on_previous_text=True))
         results[kv_cache] = [(s.start, s.end, s.text, s.avg_logprob) for s in result.segments]

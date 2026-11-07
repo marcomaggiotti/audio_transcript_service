@@ -342,8 +342,9 @@ async function refreshHealth() {
     const form = $("#transcribeForm");
     form.temperature_fallback.checked = decoding.temperature_fallback;
     form.condition_on_previous_text.checked = decoding.condition_on_previous_text;
-    form.kv_cache.checked = decoding.kv_cache;
-    $("#runKvCache").checked = decoding.kv_cache;
+    const kv = typeof decoding.kv_cache === "object" ? decoding.kv_cache.default : decoding.kv_cache;
+    form.kv_cache.checked = kv;
+    $("#runKvCache").checked = kv;
   } catch { /* older service, or no token yet: keep the page's defaults */ }
 }
 

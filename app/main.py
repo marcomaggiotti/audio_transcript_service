@@ -267,7 +267,6 @@ def create_app(settings: Settings | None = None, components: Components | None =
             vad_threshold=settings.vad_threshold if vad_threshold is None else vad_threshold,
             vad_min_silence_ms=settings.vad_min_silence_ms if vad_min_silence_ms is None else vad_min_silence_ms,
             engine=engine or "onnx", compute_type=compute_type if engine == "ctranslate2" else None,
-            kv_cache=settings.kv_cache if kv_cache is None else kv_cache,
         )
         if job.vad and service.vad is None and job.engine == "onnx":  # CTranslate2 has its own (faster-whisper's)
             raise HTTPException(503, "Voice activity detection is unavailable on this service: "
@@ -337,8 +336,6 @@ def create_app(settings: Settings | None = None, components: Components | None =
     previous_param = Form(None, description="Prompt each 30 s window with the text before it "
                                             "(default: CONDITION_ON_PREVIOUS_TEXT)")
     prompt_param = Form(None, max_length=1000, description="Vocabulary or style hint, e.g. names and terms")
-    kv_cache_param = Form(None, description="Decoder KV cache: several times faster, the same tokens; ONNX engine "
-                                            "only (default: KV_CACHE)")
     encoder_param = Form(None, pattern=r"^(fp32|int8|int4)$",
                          description="Encoder precision: fp32 (full, the default) or int8 (smaller, less accurate)")
     decoder_param = Form(None, pattern=r"^(fp32|int8|int4)$",
@@ -686,7 +683,6 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          "compression_ratio_threshold": asr.COMPRESSION_RATIO_THRESHOLD,
                          "logprob_threshold": asr.LOGPROB_THRESHOLD, "no_speech_threshold": asr.NO_SPEECH_THRESHOLD,
                          "condition_on_previous_text": settings.condition_on_previous_text,
-                         "kv_cache": settings.kv_cache,
                          "initial_prompt": settings.initial_prompt,
                          "beam_size": settings.beam_size, "max_beam_size": asr.MAX_BEAM_SIZE,
                          "reset_prompt_on_loop": settings.reset_prompt_on_loop,

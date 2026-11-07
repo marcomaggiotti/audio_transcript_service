@@ -173,7 +173,7 @@ def test_the_kv_cache_is_a_job_option(settings):
         assert kv["default"] is True and kv["available"] is True
         jobs = {}
         for value in ("true", "false", None):
-            res = upload(client, data={"language": "en", **({"kv_cache": value} if value else {})})
+            res = upload(client, data={"kv_cache": value} if value else {})
             assert res.status_code == 202, res.text
             jobs[value] = wait_for(client, res.json()["id"])
         assert all(j["status"] == "completed" for j in jobs.values()), [j["error"] for j in jobs.values()]

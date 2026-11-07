@@ -100,8 +100,6 @@ class Job(BaseModel):
     vad: bool = Field(False, description="Transcribe only the speech voice activity detection finds")
     vad_threshold: float = Field(0.5, description="Speech probability above which a 32 ms frame is speech")
     vad_min_silence_ms: int = Field(500, description="A pause at least this long ends a stretch of speech")
-    kv_cache: bool = Field(True, description="Reuse the decoder's keys and values between steps (off: re-run the "
-                                             "whole prefix every step)")
     intervals: list[tuple[float, float]] | None = Field(
         None, description="Transcribe only these [start, end] spans, each on its own: one segment per span")
     precision: dict[str, str] | None = Field(None, description="Precision actually used: {encoder, decoder}")

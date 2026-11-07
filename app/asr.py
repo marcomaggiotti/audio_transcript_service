@@ -87,15 +87,13 @@ class DecodingOptions:
     # Keep the decoder's keys/values of the tokens already written, so each step computes only the new one.
     # Off: every step recomputes them from the whole text so far, and the cross-attention keys/values of all
     # 1500 encoder frames too: the same tokens, about 10x the decoder work (times the beams with beam search).
-    # It is a speed-up only: the tokens Whisper conditions on are the same either way.
+    # It is a speed-up only: the tokens Whisper conditions on are the same either way. Exports without a merged
+    # decoder (decoder_model.onnx only) never have it.
     kv_cache: bool = True
     # Voice activity detection (app/vad.py): Whisper hears only the speech, cut at pauses into pieces up to 30 s.
     vad: bool = False
     vad_threshold: float = 0.5  # speech probability above which a 32 ms frame is speech
     vad_min_silence_ms: int = 500  # a pause at least this long ends a stretch of speech
-    # The decoder's KV cache: keep each step's self-attention keys and values and feed only the new token. Off, every
-    # step re-runs the whole prefix (same text, slower: for comparison). Exports without a merged decoder never have it.
-    kv_cache: bool = True
 
 
 @dataclass
@@ -201,23 +199,6 @@ class _PrefixSession:
         return logits[0, -1].astype(np.float32)
 
     def fork(self) -> "_PrefixSession":
-        return self
-
-
-class _UncachedSession:
-    """Merged decoder with its KV cache off: every step takes the first-call branch with the whole prefix and no past,
-    so nothing is kept between steps (what _CachedSession saves, measured)."""
-
-    def __init__(self, decoder, outputs: list[str], encoded: np.ndarray, empty_past: dict):
-        self.decoder, self.outputs, self.encoded, self.empty_past = decoder, outputs, encoded, empty_past
-
-    def __call__(self, tokens: list[int]) -> np.ndarray:
-        outputs = self.decoder.run(None, {"input_ids": np.array([tokens], dtype=np.int64),
-                                          "encoder_hidden_states": self.encoded,
-                                          "use_cache_branch": np.array([False]), **self.empty_past})
-        return outputs[self.outputs.index("logits")][0, -1].astype(np.float32)
-
-    def fork(self) -> "_UncachedSession":
         return self
 
 
@@ -553,6 +534,11 @@ class OnnxWhisperTranscriber:
 
     def _next_logits(self, tokens: list[int], encoded: np.ndarray) -> np.ndarray:
         return self._decoder_session(encoded)(tokens)
+
+    @property
+    def kv_cache_available(self) -> bool:
+        """Whether this export's decoder has a KV cache (the merged decoder); legacy exports re-run the prefix."""
+        return self._kv_cache
 
     def _decoder_session(self, encoded: np.ndarray, kv_cache: bool = True):
         """Return step(tokens) -> logits for the next token, for one window.

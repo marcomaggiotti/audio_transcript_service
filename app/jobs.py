@@ -224,6 +224,7 @@ class TranscriptionService:
                 job.precision = {"encoder": job.compute_type or "int8", "decoder": job.compute_type or "int8"}
                 weights_mb = self.ct2.size_mb()
                 result = self.ct2.transcribe(loaded.pop(), audio, options, progress)
+                kv_cache = True  # CTranslate2 always decodes with its KV cache
             else:
                 result, t_load, weights_mb, kv_cache = self._onnx(job, audio, options, progress, loading)
             t2 = time.perf_counter()
