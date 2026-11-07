@@ -93,6 +93,9 @@ class DecodingOptions:
     vad: bool = False
     vad_threshold: float = 0.5  # speech probability above which a 32 ms frame is speech
     vad_min_silence_ms: int = 500  # a pause at least this long ends a stretch of speech
+    # The decoder's KV cache: keep each step's self-attention keys and values and feed only the new token. Off, every
+    # step re-runs the whole prefix (same text, slower: for comparison). Exports without a merged decoder never have it.
+    kv_cache: bool = True
 
 
 @dataclass
@@ -198,6 +201,23 @@ class _PrefixSession:
         return logits[0, -1].astype(np.float32)
 
     def fork(self) -> "_PrefixSession":
+        return self
+
+
+class _UncachedSession:
+    """Merged decoder with its KV cache off: every step takes the first-call branch with the whole prefix and no past,
+    so nothing is kept between steps (what _CachedSession saves, measured)."""
+
+    def __init__(self, decoder, outputs: list[str], encoded: np.ndarray, empty_past: dict):
+        self.decoder, self.outputs, self.encoded, self.empty_past = decoder, outputs, encoded, empty_past
+
+    def __call__(self, tokens: list[int]) -> np.ndarray:
+        outputs = self.decoder.run(None, {"input_ids": np.array([tokens], dtype=np.int64),
+                                          "encoder_hidden_states": self.encoded,
+                                          "use_cache_branch": np.array([False]), **self.empty_past})
+        return outputs[self.outputs.index("logits")][0, -1].astype(np.float32)
+
+    def fork(self) -> "_UncachedSession":
         return self
 
 

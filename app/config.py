@@ -47,6 +47,8 @@ class Settings(BaseModel):
     vad_model_path: str = _env("VAD_MODEL_PATH", "./models/vad/silero_vad.onnx")
     vad_threshold: float = float(_env("VAD_THRESHOLD", "0.5"))
     vad_min_silence_ms: int = int(_env("VAD_MIN_SILENCE_MS", "500"))
+    # The decoder's KV cache (merged decoder): feed one new token per step. false: re-run the whole prefix each step.
+    kv_cache: bool = _flag("KV_CACHE", "true")
 
     # Benchmark tab: every subdirectory of MODELS_DIR holding an export can be compared.
     models_dir: str = _env("MODELS_DIR", "./models")

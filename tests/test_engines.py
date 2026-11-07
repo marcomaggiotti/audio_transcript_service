@@ -127,6 +127,7 @@ def test_a_job_on_ctranslate2(settings, ct2_dir, monkeypatch):
         assert job["status"] == "completed", job["error"]
         assert job["engine"] == "ctranslate2" and job["precision"] == {"encoder": "float32", "decoder": "float32"}
         assert job["metrics"]["engine"] == "ctranslate2" and job["metrics"]["model_mb"] == 2.0 and resets
+        assert job["metrics"]["kv_cache"] is True  # CTranslate2 always decodes with its KV cache
         transcript = client.get(f"/jobs/{job['id']}/transcript").json()
         assert transcript["text"] == "Hello from CTranslate2. Bye." and transcript["segments"][1]["start"] == 1.2
         [load] = FakeWhisperModel.loads
@@ -160,3 +161,29 @@ def test_what_ctranslate2_refuses(settings, ct2_dir, tmp_path):
 
 
 _ = make_wav
+
+
+def test_the_kv_cache_is_a_job_option(settings):
+    from tests.test_asr import EOT, make_merged, ts
+
+    transcriber = make_merged([[ts(0), 0, 1, ts(0.5), EOT]] * 3)
+    transcriber.name, transcriber.precision = "whisper-onnx", {"encoder": "fp32", "decoder": "fp32"}
+    with TestClient(create_app(settings, Components(transcriber=transcriber))) as client:
+        kv = client.get("/config").json()["decoding"]["kv_cache"]
+        assert kv["default"] is True and kv["available"] is True
+        jobs = {}
+        for value in ("true", "false", None):
+            res = upload(client, data={"language": "en", **({"kv_cache": value} if value else {})})
+            assert res.status_code == 202, res.text
+            jobs[value] = wait_for(client, res.json()["id"])
+        assert all(j["status"] == "completed" for j in jobs.values()), [j["error"] for j in jobs.values()]
+        assert (jobs["true"]["kv_cache"], jobs["false"]["kv_cache"], jobs[None]["kv_cache"]) == (True, False, True)
+        assert [jobs[v]["metrics"]["kv_cache"] for v in ("true", "false", None)] == [True, False, True]
+        texts = {client.get(f"/jobs/{j['id']}/transcript").json()["text"] for j in jobs.values()}
+        assert texts == {"hello world"}  # the same text with and without the cache
+    settings.kv_cache = False  # KV_CACHE=false: off unless a job asks for it
+    with TestClient(create_app(settings, Components(transcriber=FakeTranscriber()))) as client:
+        assert client.get("/config").json()["decoding"]["kv_cache"] == {
+            **client.get("/config").json()["decoding"]["kv_cache"], "default": False, "available": False}
+        job = wait_for(client, upload(client).json()["id"])
+        assert job["kv_cache"] is False and job["metrics"]["kv_cache"] is None  # a fake can't say
