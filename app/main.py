@@ -277,6 +277,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
                                         else condition_on_previous_text),
             initial_prompt=(initial_prompt or settings.initial_prompt or "").strip() or None,
             kv_cache=settings.kv_cache if kv_cache is None else kv_cache,
+            graph_optimization=None if engine == "ctranslate2" else graph_optimization,  # None: as the model is loaded
             encoder_precision=encoder, decoder_precision=decoder,
             requested_model=service.models.find(model).id if model else None,
             intervals=intervals,

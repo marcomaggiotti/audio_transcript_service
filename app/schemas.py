@@ -94,6 +94,8 @@ class Job(BaseModel):
     condition_on_previous_text: bool = Field(False, description="Prompt each window with the text before it")
     initial_prompt: str | None = Field(None, description="Vocabulary or style hint given to every window")
     kv_cache: bool = Field(True, description="Decoder KV cache: faster, same tokens (ONNX engine only)")
+    graph_optimization: str | None = Field(None, description="ONNX Runtime graph optimization level the sessions are "
+                                                             "opened at: disabled, basic, extended, layout, all")
     encoder_precision: str | None = Field(None, description="Requested encoder precision (fp32, int8, int4); None = default")
     decoder_precision: str | None = Field(None, description="Requested decoder precision (fp32, int8, int4); None = default")
     engine: str = Field("onnx", description="onnx (ONNX Runtime) or ctranslate2 (CTranslate2 through faster-whisper)")

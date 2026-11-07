@@ -39,7 +39,7 @@ A multilingual export is refused when it loads, and left out of `MODELS_DIR`. Re
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/transcribe?format=json\|text\|srt\|vtt` | Multipart `file` (WAV, MP3, OGG/Opus, M4A, FLAC) and optional `temperature_fallback`, `condition_on_previous_text`, `reset_on_loop`, `vad` (`true`/`false`), `vad_threshold`, `vad_min_silence_ms`, `beam_size`, `initial_prompt` and `intervals`. Waits and returns the transcript |
+| `POST` | `/transcribe?format=json\|text\|srt\|vtt` | Multipart `file` (WAV, MP3, OGG/Opus, M4A, FLAC) and optional `temperature_fallback`, `condition_on_previous_text`, `reset_on_loop`, `vad` (`true`/`false`), `vad_threshold`, `vad_min_silence_ms`, `beam_size`, `kv_cache`, `graph_optimization`, `initial_prompt` and `intervals`. Waits and returns the transcript |
 | `POST` | `/jobs` | Same upload, transcribed in the background. Returns `202` with the job id, `status_url` and `transcript_url` |
 | `GET` | `/jobs` | Recent jobs, newest first |
 | `GET` | `/jobs/{id}` | Status, `stage` (decoding, transcribing), `progress` (0–1, updated after each 30 s window), `queue_position` while queued, model, timings and metrics, or the error if it failed |

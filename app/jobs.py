@@ -225,7 +225,7 @@ class TranscriptionService:
                 job.precision = {"encoder": job.compute_type or "int8", "decoder": job.compute_type or "int8"}
                 weights_mb = self.ct2.size_mb()
                 result = self.ct2.transcribe(loaded.pop(), audio, options, progress)
-                kv_cache = True  # CTranslate2 always decodes with its KV cache
+                extra = {"kv_cache": True}  # CTranslate2 always decodes with its KV cache
             else:
                 result, t_load, weights_mb, extra = self._onnx(job, audio, options, progress, loading)
             t2 = time.perf_counter()
@@ -250,13 +250,13 @@ class TranscriptionService:
             # Only the speech (VAD), and one segment per requested interval, when the job asks for them.
             def run(audio, on_progress, options, _t=transcriber):
                 return transcribe_with(_t, audio, on_progress, options, self.vad, job.intervals)
-            t_load = time.perf_counter()  # inference is timed from here: loading isn't inference
             job.model = transcriber.name
             switch = getattr(transcriber, "precision_for", None)  # absent on test fakes
             optimize = getattr(transcriber, "optimization_for", None)
             graph = {"level": None, "session_seconds": None}
             if switch is None:
                 job.precision = getattr(transcriber, "precision", None)
+                t_load = time.perf_counter()  # inference is timed from here: loading isn't inference
                 result = run(audio, on_progress=progress, options=options)
             else:
                 # The graph optimization level first (it reopens the default precisions), then the precisions (opened
@@ -264,6 +264,7 @@ class TranscriptionService:
                 with (optimize(job.graph_optimization) if optimize else nullcontext(graph)) as graph, \
                         switch(job.encoder_precision, job.decoder_precision) as used:
                     job.precision = used
+                    t_load = time.perf_counter()
                     result = run(audio, on_progress=progress, options=options)
             weights = getattr(transcriber, "weights_mb", lambda used: None)(job.precision)
             available = getattr(transcriber, "kv_cache_available", None)  # None: a test fake, can't say
