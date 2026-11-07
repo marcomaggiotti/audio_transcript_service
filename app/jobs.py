@@ -11,6 +11,7 @@ import functools
 import logging
 import time
 from collections import OrderedDict
+from contextlib import nullcontext
 from collections.abc import Callable
 from pathlib import Path
 
@@ -206,9 +207,9 @@ class TranscriptionService:
                 job.precision = {"encoder": job.compute_type or "int8", "decoder": job.compute_type or "int8"}
                 weights_mb = self.ct2.size_mb()
                 result = self.ct2.transcribe(loaded.pop(), audio, job.language, options, progress)
-                kv_cache = True  # CTranslate2 always decodes with its KV cache
+                extra = {"kv_cache": True}  # CTranslate2 always decodes with its KV cache
             else:
-                result, t_load, weights_mb, kv_cache = self._onnx(job, audio, options, progress, loading)
+                result, t_load, weights_mb, extra = self._onnx(job, audio, options, progress, loading)
             t2 = time.perf_counter()
         except Exception as e:
             logger.exception("Transcription failed for %s", job_id)
@@ -216,34 +217,42 @@ class TranscriptionService:
             job.status, job.finished_at, job.stage = JobStatus.failed, utcnow(), None
             path.unlink(missing_ok=True)
             return
-        self._finish(job, result, seconds, t0, t1, t_load, t2, weights_mb, kv_cache)
+        self._finish(job, result, seconds, t0, t1, t_load, t2, weights_mb, extra)
 
     def _onnx(self, job: Job, audio, options: DecodingOptions, progress, loading):
-        """ONNX Runtime: the service's model, or the one the job asked for, in the precisions asked for. Returns the
-        result, when inference started (after any loading), the size of the weights it ran with and whether its
-        decoder used the KV cache."""
+        """ONNX Runtime: the service's model, or the one the job asked for, in the precisions and at the graph
+        optimization level asked for. Returns the result, when inference started (after any loading or reopening), the
+        size of the weights it ran with, and metrics: whether the decoder used its KV cache, the graph optimization
+        level and how long opening the sessions at it took."""
         # The service's model, or the one the job asked for, loaded for it and released after it.
         with self.models.use(job.requested_model, on_load=loading) as transcriber:
             job.stage = "transcribing"
             # Only the speech (VAD), and one segment per requested interval, when the job asks for them.
             def run(audio, language, on_progress, options, _t=transcriber):
                 return transcribe_with(_t, audio, language, on_progress, options, self.vad, job.intervals)
-            t_load = time.perf_counter()  # inference is timed from here: loading isn't inference
             job.model = transcriber.name
             switch = getattr(transcriber, "precision_for", None)  # absent on test fakes
+            optimize = getattr(transcriber, "optimization_for", None)
+            graph = {"level": None, "session_seconds": None}
             if switch is None:
                 job.precision = getattr(transcriber, "precision", None)
+                t_load = time.perf_counter()  # inference is timed from here: loading isn't inference
                 result = run(audio, language=job.language, on_progress=progress, options=options)
             else:
-                with switch(job.encoder_precision, job.decoder_precision) as used:
+                # The graph optimization level first (it reopens the default precisions), then the precisions (opened
+                # at that level); inference is timed once both are in place.
+                with (optimize(job.graph_optimization) if optimize else nullcontext(graph)) as graph, \
+                        switch(job.encoder_precision, job.decoder_precision) as used:
                     job.precision = used
+                    t_load = time.perf_counter()
                     result = run(audio, language=job.language, on_progress=progress, options=options)
             weights = getattr(transcriber, "weights_mb", lambda used: None)(job.precision)
             available = getattr(transcriber, "kv_cache_available", None)  # None: a test fake, can't say
-        return result, t_load, weights, (None if available is None else bool(available and options.kv_cache))
+        return result, t_load, weights, {"kv_cache": None if available is None else bool(available and options.kv_cache),
+                                         "graph_optimization": graph["level"], "session_seconds": graph["session_seconds"]}
 
     def _finish(self, job: Job, result, seconds: float, t0: float, t1: float, t_load: float, t2: float,
-                weights_mb: float | None, kv_cache: bool | None = None) -> None:
+                weights_mb: float | None, extra: dict | None = None) -> None:
         job.transcript = Transcript(
             language=result.language or job.language,
             duration_seconds=round(seconds, 2),
@@ -265,7 +274,7 @@ class TranscriptionService:
             real_time_factor=round((t2 - t_load) / seconds, 3) if seconds else 0.0,
             load_seconds=round(t_load - t1, 3) if t_load - t1 >= 0.01 else None,
             peak_memory_mb=peak_memory_mb(),
-            engine=job.engine, model_mb=weights_mb, kv_cache=kv_cache,
+            engine=job.engine, model_mb=weights_mb, **(extra or {}),
         )
         # Status last, so a reader that sees "completed" also sees the transcript.
         job.progress, job.stage = 1.0, None

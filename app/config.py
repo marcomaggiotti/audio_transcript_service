@@ -30,6 +30,9 @@ class Settings(BaseModel):
     ct2_model_dir: str = _env("CT2_MODEL_DIR", "")
     # Skip ONNX Runtime's pre-packed weight copies: ~25 MB less RAM, decoder steps ~2x slower.
     whisper_low_memory: bool = _flag("WHISPER_LOW_MEMORY")
+    # ONNX Runtime's graph optimization when a model opens: disabled, basic, extended, layout or all (a job can ask for
+    # another level: its sessions are reopened at it for the job).
+    onnx_graph_optimization: str = _env("ONNX_GRAPH_OPTIMIZATION", "all")
     # Decoding defaults (a request can override them): openai/whisper's temperature fallback, and
     # prompting each 30 s window with the text before it. INITIAL_PROMPT: vocabulary/style hint.
     temperature_fallback: bool = _flag("TEMPERATURE_FALLBACK", "true")

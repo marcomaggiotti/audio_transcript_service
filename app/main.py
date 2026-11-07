@@ -101,7 +101,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
             try:
                 transcriber = OnnxWhisperTranscriber.from_dir(
                     settings.whisper_model_dir, settings.max_new_tokens, settings.onnx_threads,
-                    low_memory=settings.whisper_low_memory,
+                    low_memory=settings.whisper_low_memory, graph_optimization=settings.onnx_graph_optimization,
                 )
                 logger.info("Loaded speech model %s", transcriber.name)
             except Exception as e:  # keep serving: /health reports the reason, /healthz fails
@@ -110,7 +110,8 @@ def create_app(settings: Settings | None = None, components: Components | None =
 
         def load_model(path: Path) -> Transcriber:
             return OnnxWhisperTranscriber.from_dir(str(path), settings.max_new_tokens, settings.onnx_threads,
-                                                   low_memory=settings.whisper_low_memory)
+                                                   low_memory=settings.whisper_low_memory,
+                                                   graph_optimization=settings.onnx_graph_optimization)
 
         # Models a job can choose: the service's own, and every other export in MODELS_DIR (EXTRA_MODELS).
         models = ModelSet(transcriber, settings.whisper_model_dir, settings.models_dir,
@@ -254,7 +255,8 @@ def create_app(settings: Settings | None = None, components: Components | None =
                    intervals: list[tuple[float, float]] | None = None, beam_size: int | None = None,
                    reset_on_loop: bool | None = None, vad: bool | None = None, vad_threshold: float | None = None,
                    vad_min_silence_ms: int | None = None, engine: str | None = None,
-                   compute_type: str | None = None, kv_cache: bool | None = None) -> Job:
+                   compute_type: str | None = None, kv_cache: bool | None = None,
+                   graph_optimization: str | None = None) -> Job:
         """Queue the audio at service.upload_path(job_id), with the default decoding options unless given."""
         job = Job(
             id=job_id, filename=filename, size_bytes=size, language=None if language == "auto" else language,
@@ -273,6 +275,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
             vad_min_silence_ms=settings.vad_min_silence_ms if vad_min_silence_ms is None else vad_min_silence_ms,
             engine=engine or "onnx", compute_type=compute_type if engine == "ctranslate2" else None,
             kv_cache=settings.kv_cache if kv_cache is None else kv_cache,
+            graph_optimization=None if engine == "ctranslate2" else graph_optimization,  # None: as the model is loaded
         )
         if job.vad and service.vad is None and job.engine == "onnx":  # CTranslate2 has its own (faster-whisper's)
             raise HTTPException(503, "Voice activity detection is unavailable on this service: "
@@ -368,6 +371,11 @@ def create_app(settings: Settings | None = None, components: Components | None =
     kv_cache_param = Form(None, description="The decoder's KV cache: keep each step's keys and values and feed only the "
                                             "new token (fast). false: re-run the whole prefix every step, same text, "
                                             "slower; for comparison. CTranslate2 always uses it (default: KV_CACHE, true)")
+    graph_param = Form(None, pattern=r"^(disabled|basic|extended|layout|all)$",
+                       description="ONNX Runtime graph optimization for this job: disabled, basic (constant folding), "
+                                   "extended (fused operators), layout (and the CPU's memory layout) or all. Another "
+                                   "level than the loaded one reopens the model for the job (default: "
+                                   "ONNX_GRAPH_OPTIMIZATION, all)")
     engine_param = Form(None, pattern=r"^(onnx|ctranslate2)$",
                         description="Inference engine: onnx (ONNX Runtime, default) or ctranslate2 (the same model on "
                                     "CTranslate2 through faster-whisper; see GET /config engines)")
@@ -391,7 +399,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          vad_threshold: float | None = vad_threshold_param,
                          vad_min_silence_ms: int | None = vad_silence_param,
                          engine: str | None = engine_param, compute_type: str | None = compute_type_param,
-                         kv_cache: bool | None = kv_cache_param):
+                         kv_cache: bool | None = kv_cache_param, graph_optimization: str | None = graph_param):
         """Upload audio and wait for its transcript. Shares the job queue, so it waits its turn."""
         service = service_of(request)
         job = await accept_upload(service, file, language, temperature_fallback=temperature_fallback,
@@ -399,7 +407,8 @@ def create_app(settings: Settings | None = None, components: Components | None =
                                   initial_prompt=initial_prompt, encoder=encoder, decoder=decoder, model=model,
                                   intervals=intervals, beam_size=beam_size, reset_on_loop=reset_on_loop, vad=vad,
                                   vad_threshold=vad_threshold, vad_min_silence_ms=vad_min_silence_ms,
-                                  engine=engine, compute_type=compute_type, kv_cache=kv_cache)
+                                  engine=engine, compute_type=compute_type, kv_cache=kv_cache,
+                                  graph_optimization=graph_optimization)
         try:
             job = await service.wait(job.id)
         finally:
@@ -422,7 +431,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          vad_threshold: float | None = vad_threshold_param,
                          vad_min_silence_ms: int | None = vad_silence_param,
                          engine: str | None = engine_param, compute_type: str | None = compute_type_param,
-                         kv_cache: bool | None = kv_cache_param):
+                         kv_cache: bool | None = kv_cache_param, graph_optimization: str | None = graph_param):
         """Upload audio for background transcription; poll the status URL, then fetch the transcript.
 
         `model` picks the speech model and `encoder` / `decoder` the precision of each part for this job (see
@@ -432,7 +441,8 @@ def create_app(settings: Settings | None = None, components: Components | None =
                                   initial_prompt=initial_prompt, encoder=encoder, decoder=decoder, model=model,
                                   intervals=intervals, beam_size=beam_size, reset_on_loop=reset_on_loop, vad=vad,
                                   vad_threshold=vad_threshold, vad_min_silence_ms=vad_min_silence_ms,
-                                  engine=engine, compute_type=compute_type, kv_cache=kv_cache)
+                                  engine=engine, compute_type=compute_type, kv_cache=kv_cache,
+                                  graph_optimization=graph_optimization)
         return summary(job)
 
     @app.get("/jobs", response_model=list[JobSummary])
@@ -673,7 +683,11 @@ def create_app(settings: Settings | None = None, components: Components | None =
                       "onnx_threads": settings.onnx_threads, "runtime": "ONNX Runtime (CPU)"},
             "models": [m.view(*service.models.fits(m)) for m in service.models.list()],
             "engines": {"onnx": {"available": t is not None, "runtime": "ONNX Runtime (CPU)",
-                                 "precisions": list(asr.PRECISIONS)},
+                                 "precisions": list(asr.PRECISIONS),
+                                 "graph_optimization": {"default": getattr(t, "graph_optimization", None)
+                                                        or settings.onnx_graph_optimization,
+                                                        "levels": list(asr.GRAPH_LEVELS),
+                                                        "session_seconds": getattr(t, "session_seconds", None)}},
                         "ctranslate2": service.ct2.status() if service.ct2 else {"available": False, "error": "not set up"}},
             "memory_limit_mb": round(service.models.limit_mb) if service.models.limit_mb else None,
             "audio": {"decoder": "ffmpeg (pure-Python fallback for WAV)", "sample_rate": features.SAMPLE_RATE,

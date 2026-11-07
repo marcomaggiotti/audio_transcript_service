@@ -187,3 +187,60 @@ def test_the_kv_cache_is_a_job_option(settings):
             **client.get("/config").json()["decoding"]["kv_cache"], "default": False, "available": False}
         job = wait_for(client, upload(client).json()["id"])
         assert job["kv_cache"] is False and job["metrics"]["kv_cache"] is None  # a fake can't say
+
+
+def graph_transcriber(opened):
+    """A transcriber on scripted sessions whose sessions can be reopened at a graph optimization level."""
+    from tests.test_asr import EOT, FakeEncoder, MergedDecoder, make_merged, ts
+
+    script = [[ts(0), 0, 1, ts(0.5), EOT]]
+    t = make_merged(script)
+    t.name, t.precision = "whisper-onnx", {"encoder": "fp32", "decoder": "fp32"}
+    t.variants = {"encoder": {"fp32": Path("encoder_model.onnx")}, "decoder": {"fp32": Path("decoder_model_merged.onnx")}}
+    t.graph_optimization, t.session_seconds = "all", 0.9
+
+    def open_session(file, level):
+        opened.append((file.name.split("_")[0], level))
+        return FakeEncoder() if file.name.startswith("encoder") else MergedDecoder(script)
+    t._open_session = open_session
+    return t
+
+
+def test_the_graph_optimization_level_reopens_the_sessions_for_the_block():
+    opened = []
+    t = graph_transcriber(opened)
+    with t.optimization_for("all") as same:  # the level it's loaded at: nothing reopened
+        assert same == {"level": "all", "session_seconds": 0.9} and opened == []
+    with t.optimization_for("basic") as graph:
+        assert graph["level"] == "basic" and graph["session_seconds"] >= 0 and t.graph_optimization == "basic"
+        assert t.transcribe(np.zeros(16000, dtype=np.float32), "en").text == "hello world"
+    assert opened == [("encoder", "basic"), ("decoder", "basic"), ("encoder", "all"), ("decoder", "all")]
+    assert t.graph_optimization == "all"
+    with pytest.raises(ValueError, match="Unknown graph optimization level"):
+        with t.optimization_for("max"):
+            pass
+
+
+def test_the_graph_optimization_is_a_job_option(settings):
+    opened = []
+    with TestClient(create_app(settings, Components(transcriber=graph_transcriber(opened)))) as client:
+        onnx = client.get("/config").json()["engines"]["onnx"]["graph_optimization"]
+        assert onnx == {"default": "all", "levels": ["disabled", "basic", "extended", "layout", "all"], "session_seconds": 0.9}
+        job = wait_for(client, upload(client, data={"language": "en", "graph_optimization": "disabled"}).json()["id"])
+        assert job["status"] == "completed", job["error"]
+        assert job["graph_optimization"] == "disabled" and job["metrics"]["graph_optimization"] == "disabled"
+        assert job["metrics"]["session_seconds"] is not None and opened[:2] == [("encoder", "disabled"), ("decoder", "disabled")]
+        plain = wait_for(client, upload(client, data={"language": "en"}).json()["id"])
+        assert plain["metrics"]["graph_optimization"] == "all" and plain["metrics"]["session_seconds"] == 0.9
+        assert upload(client, data={"graph_optimization": "max"}).status_code == 422
+    with TestClient(create_app(settings, Components(transcriber=FakeTranscriber()))) as client:
+        job = wait_for(client, upload(client, data={"graph_optimization": "basic"}).json()["id"])
+        assert job["graph_optimization"] == "basic" and job["metrics"]["graph_optimization"] is None  # a fake can't say
+
+
+def test_the_levels_are_onnx_runtimes():
+    from app.asr import graph_level
+    import onnxruntime as ort
+
+    assert graph_level("disabled") == ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    assert graph_level("all") == ort.GraphOptimizationLevel.ORT_ENABLE_ALL

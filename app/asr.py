@@ -21,6 +21,7 @@ repeats or is unsure), prompting with the previous text, and an initial prompt.
 import json
 import logging
 import os
+import time
 import zlib
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -233,6 +234,20 @@ class ModelLoadError(RuntimeError):
 
 
 PRECISIONS = ("fp32", "int8", "int4")
+# ONNX Runtime rewrites the graph when it opens a model (GraphOptimizationLevel): basic = constant folding and redundant
+# nodes removed; extended = fused operators (attention, LayerNorm, GELU, MatMul+Add); layout = also the CPU's memory
+# layout; all = everything. Higher levels take longer to open and usually run faster.
+GRAPH_LEVELS = ("disabled", "basic", "extended", "layout", "all")
+
+
+def graph_level(name: str):
+    import onnxruntime as ort
+
+    levels = {"disabled": ort.GraphOptimizationLevel.ORT_DISABLE_ALL, "basic": ort.GraphOptimizationLevel.ORT_ENABLE_BASIC,
+              "extended": ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED, "all": ort.GraphOptimizationLevel.ORT_ENABLE_ALL}
+    if name == "layout":  # ONNX Runtime 1.22+; before, layout came only with all
+        return getattr(ort.GraphOptimizationLevel, "ORT_ENABLE_LAYOUT", ort.GraphOptimizationLevel.ORT_ENABLE_ALL)
+    return levels[name]
 
 
 def _release_memory() -> None:
@@ -332,6 +347,9 @@ class OnnxWhisperTranscriber:
         self.precision: dict[str, str] | None = None
         self.variants: dict[str, dict[str, Path]] = {}
         self._load_session: Callable[[Path], object] | None = None
+        self._open_session: Callable[[Path, str], object] | None = None  # (file, graph optimization level)
+        self.graph_optimization: str | None = None  # the level the loaded sessions were opened with
+        self.session_seconds: float | None = None  # how long opening them took (optimizing the graph included)
         self._bind(encoder, decoder)
 
     def _bind(self, encoder, decoder) -> None:
@@ -358,7 +376,7 @@ class OnnxWhisperTranscriber:
 
     @classmethod
     def from_dir(cls, model_dir: str, max_new_tokens: int = 224, threads: int = 0,
-                 low_memory: bool = False) -> "OnnxWhisperTranscriber":
+                 low_memory: bool = False, graph_optimization: str = "all") -> "OnnxWhisperTranscriber":
         import onnxruntime as ort
         from tokenizers import Tokenizer
 
@@ -382,8 +400,18 @@ class OnnxWhisperTranscriber:
         if low_memory:  # ~-25 MB RSS (no pre-packed weight copies), decoder steps ~2x slower
             options.add_session_config_entry("session.disable_prepacking", "1")
         providers = ["CPUExecutionProvider"]
-        encoder = ort.InferenceSession(str(path / "encoder_model.onnx"), options, providers=providers)
-        decoder = ort.InferenceSession(str(path / decoder_file), options, providers=providers)
+
+        def open_session(file: Path, level: str):
+            options.graph_optimization_level = graph_level(level)  # read when the session is created
+            return ort.InferenceSession(str(file), options, providers=providers)
+
+        if graph_optimization not in GRAPH_LEVELS:
+            logger.warning("Unknown graph optimization level %r (%s): using all", graph_optimization, ", ".join(GRAPH_LEVELS))
+            graph_optimization = "all"
+        t0 = time.perf_counter()
+        encoder = open_session(path / "encoder_model.onnx", graph_optimization)
+        decoder = open_session(path / decoder_file, graph_optimization)
+        opened = time.perf_counter() - t0
         tokenizer = Tokenizer.from_file(str(path / "tokenizer.json"))
 
         tokens = _resolve_tokens(tokenizer, _load_json(path / "generation_config.json"))
@@ -401,7 +429,9 @@ class OnnxWhisperTranscriber:
                 if p not in files and (path / f"{stem}.{p}.onnx").exists():
                     files[p] = path / f"{stem}.{p}.onnx"
             transcriber.variants[part] = files
-        transcriber._load_session = lambda file: ort.InferenceSession(str(file), options, providers=providers)
+        transcriber._open_session = open_session
+        transcriber._load_session = lambda file: open_session(file, transcriber.graph_optimization or graph_optimization)
+        transcriber.graph_optimization, transcriber.session_seconds = graph_optimization, round(opened, 3)
         return transcriber
 
     def weights_mb(self, used: dict[str, str] | None = None) -> float | None:
@@ -444,6 +474,35 @@ class OnnxWhisperTranscriber:
             if swapped:
                 self._swap({part: default[part] for part in swapped})
                 _release_memory()  # the variant's weights are freed by the swap: return them too
+
+    @contextmanager
+    def optimization_for(self, level: str | None = None):
+        """Transcribe with sessions opened at this graph optimization level inside the block (None = as loaded), then
+        go back. Another level reopens both parts (the old sessions released first, as a precision swap does): the
+        graph is optimized when a session opens. Yields {level, session_seconds}: the level used and how long opening
+        the sessions at it took (this job's reopening, or the service's start)."""
+        default = self.graph_optimization
+        if not level or level == default or self._open_session is None:
+            yield {"level": default, "session_seconds": self.session_seconds}
+            return
+        if level not in GRAPH_LEVELS:
+            raise ValueError(f"Unknown graph optimization level {level} ({', '.join(GRAPH_LEVELS)})")
+        files = {part: self.variants[part][self.precision[part]] for part in ("encoder", "decoder")}
+
+        def reopen(at: str) -> float:
+            self.encoder = self.decoder = None  # release before reopening: never two copies in memory
+            _release_memory()
+            t0 = time.perf_counter()
+            encoder, decoder = self._open_session(files["encoder"], at), self._open_session(files["decoder"], at)
+            self.graph_optimization = at
+            self._bind(encoder, decoder)
+            return round(time.perf_counter() - t0, 3)
+
+        try:
+            yield {"level": level, "session_seconds": reopen(level)}
+        finally:
+            reopen(default)
+            _release_memory()
 
     def _swap(self, precisions: dict[str, str]) -> None:
         """Replace these parts' sessions with the given precision, releasing the old session first."""
