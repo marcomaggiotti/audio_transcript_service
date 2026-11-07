@@ -28,6 +28,7 @@ Pipeline (each step keeps the graphs runnable on the runtime's onnxruntime):
 """
 
 import argparse
+import json
 import shutil
 import subprocess
 import sys
@@ -223,7 +224,8 @@ def smoke_test(output: Path) -> None:
     names = [o.name for o in dec.get_outputs()]
     past = {i.name: np.zeros((1, i.shape[1], 0, i.shape[3]), np.float32)
             for i in dec.get_inputs() if i.name.startswith("past_key_values.")}
-    ids = [50258]
+    config = json.loads((output / "config.json").read_text()) if (output / "config.json").exists() else {}
+    ids = [config.get("decoder_start_token_id") or 50257]  # <|startoftranscript|> of this vocabulary
     for step in range(2):
         out = dict(zip(names, dec.run(None, {"input_ids": np.array([ids[-1:] if step else ids], np.int64),
                                              "encoder_hidden_states": hidden,
@@ -258,9 +260,6 @@ def main() -> int:
     if not shutil.which("optimum-cli"):
         print("optimum-cli not found: pip install -r requirements-export.txt", file=sys.stderr)
         return 1
-
-    import json
-
 
     output = Path(args.output)
     cmd = ["optimum-cli", "export", "onnx", "--model", args.model,

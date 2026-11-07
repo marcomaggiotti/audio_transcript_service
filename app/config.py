@@ -1,6 +1,7 @@
 """Runtime configuration, read from environment variables."""
 
 import os
+import sys
 from functools import lru_cache
 
 from pydantic import BaseModel
@@ -53,6 +54,15 @@ class Settings(BaseModel):
     # Reference recordings, clips (interval audio + correct transcript) and finished runs.
     benchmark_dir: str = _env("BENCHMARK_DIR", "./data/benchmark")
     max_clip_seconds: int = int(_env("MAX_CLIP_SECONDS", "300"))
+
+    # Fine-tuning on the benchmark set (app/training.py): runs, their logs and the fine-tuned models (exported to ONNX,
+    # chosen like the others). TRAINING_PYTHON needs PyTorch and transformers: the image builds /opt/train with
+    # --build-arg TRAINING=true. Intermediate checkpoints go to TRAINING_WORK_DIR (default: the system's temp dir),
+    # not to the persistent disk; Hugging Face's downloads to TRAINING_DIR/hf-cache (unless HF_HOME is set).
+    training_dir: str = _env("TRAINING_DIR", "./data/training")
+    training_python: str = _env("TRAINING_PYTHON", sys.executable)
+    training_threads: int = int(_env("TRAINING_THREADS", "0"))  # PyTorch's threads; 0 = PyTorch decides
+    training_work_dir: str = _env("TRAINING_WORK_DIR", "")
 
     # Shared secret for the transcription endpoints. Empty = no auth.
     api_token: str | None = _env("API_TOKEN")

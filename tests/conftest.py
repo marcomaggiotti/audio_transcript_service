@@ -65,6 +65,8 @@ def settings(tmp_path):
         max_audio_seconds=60,
         api_token=None,  # independent of an API_TOKEN exported in the developer's shell
         vad_model_path=str(tmp_path / "no-vad.onnx"),  # tests that need VAD pass a fake
+        training_dir=str(tmp_path / "training"),
+        training_work_dir=str(tmp_path / "training-work"),
     )
 
 

@@ -112,7 +112,7 @@ def discover_exports(models_dir: str) -> list[Path]:
 class ModelSet:
     def __init__(self, default: Transcriber | None, default_dir: str | None, models_dir: str | None,
                  load: Callable[[Path], Transcriber] | None, limit_mb: float | None = None,
-                 rss_mb: Callable[[], float] = current_rss_mb):
+                 rss_mb: Callable[[], float] = current_rss_mb, extra_dirs: list[str] | None = None):
         self.default = default
         self.load = load
         self.limit_mb = limit_mb
@@ -124,7 +124,8 @@ class ModelSet:
                 else ModelInfo(id=default.name, path=default_path or Path("."), default=True)
             info.id = default.name  # what jobs report as their model
             self._models[info.id] = info
-        for path in discover_exports(models_dir) if models_dir else []:
+        # MODELS_DIR, then the fine-tuned models (TRAINING_DIR/models)
+        for path in [p for root in (models_dir, *(extra_dirs or [])) if root for p in discover_exports(root)]:
             if default_path and path.resolve() == default_path:
                 continue
             if is_multilingual(path):
@@ -135,6 +136,21 @@ class ModelSet:
 
     def list(self) -> list[ModelInfo]:
         return list(self._models.values())
+
+    def add(self, path: Path) -> ModelInfo:
+        """An export made while the service runs (a fine-tuned model). The dict is replaced, not changed in place, so
+        a request listing the models meanwhile never sees it half-changed."""
+        if is_multilingual(path):
+            raise ModelUnavailable(f"{path} is a multilingual model; the service runs English-only ones")
+        info = describe_export(path)
+        self._models = {**self._models, info.id: info}
+        return info
+
+    def remove(self, model_id: str) -> None:
+        """Forget a model (not the service's own); a job already using it keeps it until it ends."""
+        info = self.find(model_id)
+        if info is not None and not info.default:
+            self._models = {k: v for k, v in self._models.items() if k != info.id}
 
     def find(self, model_id: str | None) -> ModelInfo | None:
         """By id (openai/whisper-base.en), short name (whisper-base.en) or folder name; None = the default."""

@@ -10,6 +10,10 @@ ARG EXTRA_MODELS=""
 ARG BENCHMARK_MODELS=""
 # "false" skips the CTranslate2 conversion of WHISPER_MODEL (models/whisper/ct2, for jobs with engine=ctranslate2).
 ARG CTRANSLATE2="true"
+# "true": fine-tuning (POST /training/runs, the podcast app's Training tab). Keeps WHISPER_MODEL's PyTorch weights
+# (models/whisper/torch, the base to train from) and installs PyTorch (CPU) and transformers in the runtime image
+# (/opt/train). About +1 GB of image; training whisper-tiny.en needs about 2-3 GB of memory.
+ARG TRAINING="false"
 WORKDIR /build
 COPY requirements-export.txt scripts/export_whisper_onnx.py ./
 # --index-url (not --extra-index-url) guarantees the CPU wheel instead of the multi-GB CUDA build.
@@ -20,6 +24,9 @@ RUN pip install --no-cache-dir "setuptools>=77.0.3" \
  && pip install --no-cache-dir -r requirements-export.txt
 RUN python export_whisper_onnx.py --model "$WHISPER_MODEL" --output /models/whisper --prune \
       $( [ "$CTRANSLATE2" = "true" ] && echo --ct2 ) \
+ && if [ "$TRAINING" = "true" ]; then python -c "import sys; from transformers import WhisperForConditionalGeneration \
+      as M, WhisperProcessor as P; [c.from_pretrained(sys.argv[1]).save_pretrained('/models/whisper/torch') for c in (M, P)]" \
+      "$WHISPER_MODEL"; fi \
  && for model in $EXTRA_MODELS; do \
       python export_whisper_onnx.py --model "$model" --output "/models/$(basename "$model")" --prune --no-variants; \
     done \
@@ -44,8 +51,18 @@ ENV PYTHONUNBUFFERED=1 \
     ORT_DISABLE_TELEMETRY=1
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY requirements.txt .
+COPY requirements.txt requirements-export.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
+# The training Python (TRAINING=true): PyTorch and transformers in a venv of their own, since transformers 4.57 (the
+# version the ONNX export is verified with) needs an older huggingface-hub than faster-whisper. The export tools are
+# in it too: a fine-tuned model is exported to ONNX for the service to transcribe with.
+ARG TRAINING="false"
+RUN if [ "$TRAINING" = "true" ]; then \
+      python -m venv /opt/train \
+      && /opt/train/bin/pip install --no-cache-dir "setuptools>=77.0.3" \
+      && /opt/train/bin/pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.14.1 \
+      && /opt/train/bin/pip install --no-cache-dir -r requirements-export.txt; \
+    fi
 
 COPY --from=export /models /app/models
 COPY app ./app
@@ -57,6 +74,8 @@ ENV WHISPER_MODEL_DIR=/app/models/whisper \
     MODELS_DIR=/app/models \
     VAD_MODEL_PATH=/app/models/vad/silero_vad.onnx \
     BENCHMARK_DIR=/data/benchmark \
+    TRAINING_DIR=/data/training \
+    TRAINING_PYTHON=/opt/train/bin/python \
     UPLOAD_DIR=/tmp/uploads \
     PORT=10000
 EXPOSE 10000

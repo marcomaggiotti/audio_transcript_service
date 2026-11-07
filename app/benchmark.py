@@ -306,12 +306,13 @@ class BenchmarkRunner:
 
     def __init__(self, store: BenchmarkStore, submit: Callable[[str, Callable[[], None]], None],
                  default_model: tuple[str, Transcriber] | None, models_dir: str,
-                 load_model: Callable[[Path], Transcriber], vad=None):
+                 load_model: Callable[[Path], Transcriber], vad=None, extra_dirs: list[str] | None = None):
         self.store = store
         self.vad = vad  # for the VAD variants
         self.submit = submit  # TranscriptionService.submit_task
         self.default_model = default_model  # (id, loaded transcriber) of the service's own model
         self.models_dir = models_dir
+        self.extra_dirs = list(extra_dirs or [])  # the fine-tuned models (TRAINING_DIR/models)
         self.load_model = load_model
         self.active: dict[str, BenchmarkRun] = {}  # queued or running, with live progress
 
@@ -322,12 +323,20 @@ class BenchmarkRunner:
                 run.status, run.error, run.finished_at = JobStatus.failed, "Interrupted by a restart", utcnow()
                 self.store.save_run(run)
 
+    def discover(self) -> dict[str, Path]:
+        """The exports to compare, by folder name: MODELS_DIR first, then the fine-tuned ones."""
+        found: dict[str, Path] = {}
+        for root in (self.models_dir, *self.extra_dirs):
+            for name, path in discover_models(root).items():
+                found.setdefault(name, path)
+        return found
+
     def models(self) -> list[BenchmarkModel]:
         models = []
         if self.default_model:
             model_id, transcriber = self.default_model
             models.append(BenchmarkModel(id=model_id, name=transcriber.name, default=True))
-        for model_id, path in discover_models(self.models_dir).items():
+        for model_id, path in self.discover().items():
             if not self.default_model or model_id != self.default_model[0]:
                 models.append(BenchmarkModel(id=model_id, name=model_name(path), default=False))
         return models
@@ -386,7 +395,7 @@ class BenchmarkRunner:
             t0 = time.perf_counter()
             run.progress.current = f"loading {model_id}"
             try:
-                transcriber = self.load_model(discover_models(self.models_dir)[model_id])
+                transcriber = self.load_model(self.discover()[model_id])
                 load_seconds = round(time.perf_counter() - t0, 2)
             except Exception as e:  # e.g. an export that doesn't load: report it, carry on with the others
                 error = f"Model didn't load: {e}"

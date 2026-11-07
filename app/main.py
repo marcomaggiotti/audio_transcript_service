@@ -29,6 +29,8 @@ from app.formats import RENDERERS
 from app.jobs import JobNotFound, QueueFullError, TranscriptionService
 from app.models import HEADROOM, ModelSet, ModelUnavailable, memory_limit_mb
 from app.ct2 import COMPUTE_TYPES, CT2Engine
+from app.training import TrainingManager, TrainingStore
+from app.training_api import router as training_router
 from app.vad import MAX_PIECE_SECONDS, SPEECH_PAD_MS, load_vad
 from app.schemas import (
     BenchmarkCreate,
@@ -54,7 +56,7 @@ MULTIPART_SLACK = 1024 * 1024  # form fields + boundaries on top of the file its
 STATIC_DIR = Path(__file__).parent / "static"
 UPLOAD_PATHS = ("/transcribe", "/jobs", "/benchmark/sources", "/benchmark/clips/upload")
 # Guarded when API_TOKEN is set. The web page, health checks and the API docs stay reachable.
-PROTECTED_PREFIXES = ("/transcribe", "/jobs", "/benchmark", "/benchmarks", "/config")
+PROTECTED_PREFIXES = ("/transcribe", "/jobs", "/benchmark", "/benchmarks", "/config", "/training")
 
 
 def _is_protected(path: str) -> bool:
@@ -82,6 +84,8 @@ class Components:
     vad: object | None = None
     # The model on CTranslate2 (tests pass a fake); default: CT2_MODEL_DIR, or WHISPER_MODEL_DIR/ct2.
     ct2: object | None = None
+    # The Python that fine-tunes (tests pass a stand-in script); default: TRAINING_PYTHON.
+    training_python: str | None = None
 
 
 def _clock(seconds: float) -> str:
@@ -111,11 +115,14 @@ def create_app(settings: Settings | None = None, components: Components | None =
             return OnnxWhisperTranscriber.from_dir(str(path), settings.max_new_tokens, settings.onnx_threads,
                                                    low_memory=settings.whisper_low_memory)
 
-        # Models a job can choose: the service's own, and every other export in MODELS_DIR (EXTRA_MODELS).
+        # Models a job can choose: the service's own, every other export in MODELS_DIR (EXTRA_MODELS), and the
+        # fine-tuned ones (TRAINING_DIR/models).
+        training_store = TrainingStore(settings.training_dir)
+        training_store.setup()
         models = ModelSet(transcriber, settings.whisper_model_dir, settings.models_dir,
                           components.load_model or load_model,
                           limit_mb=components.memory_limit_mb if components.memory_limit_mb is not None
-                          else memory_limit_mb())
+                          else memory_limit_mb(), extra_dirs=[str(training_store.models_dir)])
         vad, vad_error = (components.vad, None) if components.vad is not None else load_vad(settings.vad_model_path)
         if vad_error:
             logger.warning("Voice activity detection unavailable: %s", vad_error)
@@ -139,9 +146,17 @@ def create_app(settings: Settings | None = None, components: Components | None =
             store, service.submit_task,
             (Path(settings.whisper_model_dir).name, transcriber) if transcriber else None,
             settings.models_dir, components.load_model or load_model, vad=vad,
+            extra_dirs=[str(training_store.models_dir)],
         )
         app.state.benchmark.recover()
+        app.state.training = TrainingManager(
+            training_store, store, models, components.training_python or settings.training_python,
+            threads=settings.training_threads, work_dir=settings.training_work_dir or None,
+            hf_home=str(Path(settings.training_dir) / "hf-cache"),
+        )
+        app.state.training.start()
         yield
+        app.state.training.stop()
         await service.stop()
 
     app = FastAPI(
@@ -152,6 +167,8 @@ def create_app(settings: Settings | None = None, components: Components | None =
         version="1.0.0",
         lifespan=lifespan,
     )
+
+    app.include_router(training_router)
 
     @app.middleware("http")
     async def guard(request: Request, call_next):

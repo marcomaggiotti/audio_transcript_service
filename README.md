@@ -49,6 +49,7 @@ A multilingual export is refused when it loads, and left out of `MODELS_DIR`. Re
 | `GET` | `/health` | Model status, queue depth, active jobs |
 | `GET` | `/healthz` | Liveness: `503` if the speech model didn't load |
 | | `/benchmark/…`, `/benchmarks` | The benchmark: see [below](#benchmark-word-error-rate-on-your-own-audio) |
+| | `/training`, `/training/…` | Fine-tuning on the benchmark set: see [below](#fine-tuning-on-the-benchmark-set) |
 
 ```bash
 # Plain text, waiting for the result
@@ -277,6 +278,54 @@ lists the models (`models`: precisions, `needs_mb`, `fits`, `reason`) and `memor
 | whisper-base.en | 74 M parameters | between the two (not measured yet) | standard (2 GB) |
 | whisper-small.en | 244 M parameters | ~1 GB, next to tiny.en | standard (2 GB) |
 
+## Fine-tuning on the benchmark set
+
+The benchmark set's clips (lines of your recordings with their correct text) can also teach the model: `/training`
+fine-tunes it with Hugging Face's recipe (huggingface.co/blog/fine-tune-whisper), and the podcast app's **Training**
+tab shows each part with its settings:
+
+- **WhisperTokenizer**: a clip's correct text → the token ids the model learns to write (the labels). The models
+  here are English-only: the labels start `<|startoftranscript|><|notimestamps|>`, with no language or task token.
+  Settings: `predict_timestamps`, `max_label_tokens` (448 at most), `text` (`as_written` keeps case and punctuation,
+  what Whisper writes; `normalized` is lower case without punctuation). `POST /training/inspect/tokenizer` shows the
+  tokens of a text, decoded with and without the special tokens.
+- **WhisperFeatureExtractor** and **WhisperProcessor**: 16 kHz audio → an 80 × 3000 log-mel spectrogram (30 s,
+  padded). Clips longer than 30 s are left out. `POST /training/inspect/processor` shows a clip's spectrogram.
+- **Data collator** (`DataCollatorSpeechSeq2SeqWithPadding`): pads each batch's labels with −100 (ignored by the
+  loss) and cuts `<|startoftranscript|>` (the model adds it). `POST /training/inspect/collator` shows a batch.
+- **Evaluation metrics**: word error rate with the benchmark's normalization (`app/wer.py`), or character error rate;
+  the chosen one picks the best checkpoint. `POST /training/inspect/metric` scores pairs of texts.
+- **Training**: `Seq2SeqTrainer` with `Seq2SeqTrainingArguments` (`learning_rate`, `per_device_train_batch_size`,
+  `gradient_accumulation_steps`, `warmup_steps`, `max_steps`, `eval_steps`, `logging_steps`, `generation_max_length`,
+  `lr_scheduler_type`, `weight_decay`, `gradient_checkpointing`, `fp16` on a GPU, `load_best_model_at_end`, `seed`),
+  plus `freeze_encoder` (on by default: only the decoder, which writes the words, learns; less memory and less
+  overfitting on a small set).
+
+`POST /training/runs` queues a run (one at a time, never retried): the clips are shuffled and split (`test_size`,
+`seed`), the base model is scored on the test clips, trained (evaluated every `eval_steps` with `generate()`),
+scored again with its best checkpoint, saved and exported to ONNX (`scripts/export_whisper_onnx.py`) into
+`TRAINING_DIR/models/<name>`. It then joins the models a job can choose (`model=finetuned/<name>`) and the benchmark
+can compare; its PyTorch weights stay next to it, so it can be trained further. `GET /training/runs/{id}` has the
+progress, the loss and evaluation history, the error rates before and after with examples, and the clips left out;
+`POST /training/runs/{id}/stop` stops at the next step (what it learned is still scored and exported);
+`DELETE` removes the run and its model; `GET /training/runs/{id}/log` is the end of the training process's output.
+Score a fine-tuned model on its test clips only: it has seen the others.
+
+Training never runs in the API's Python. It runs in `TRAINING_PYTHON`, which needs PyTorch and transformers: the
+Docker image installs them in `/opt/train` with `--build-arg TRAINING=true` (+1 GB; transformers 4.57 needs an older
+huggingface-hub than faster-whisper, hence a Python of its own), and keeps `WHISPER_MODEL`'s PyTorch weights to
+start from. Without it, `GET /training` says what is missing. On a CPU, whisper-tiny.en trains a few steps a minute
+and needs about 2–3 GB of memory (Render pro, not starter); use a GPU machine (`TRAINING_PYTHON` pointing at a
+Python with CUDA PyTorch) for larger models or sets. About 50 clips or more make a difference.
+
+Locally:
+
+```bash
+python -m venv .train && .train/bin/pip install torch -r requirements-export.txt
+TRAINING_PYTHON=.train/bin/python python main.py
+.train/bin/python -m pytest tests/test_training_worker.py   # a tiny random Whisper: trains, exports, transcribes
+```
+
 ## Run locally
 
 ```bash
@@ -330,6 +379,11 @@ pytest
 | `WORKER_CONCURRENCY` / `MAX_QUEUE_SIZE` | `1` / `20` | Parallel transcriptions; uploads get `503` when the queue is full |
 | `MAX_FINISHED_JOBS` | `200` | Finished jobs kept for `GET /jobs/{id}`; older ones are forgotten |
 | `UPLOAD_DIR` | `./data/uploads` | Uploads wait here until decoded, then are deleted |
+| `TRAINING` | `false` | Build arg: PyTorch and transformers in the image (`/opt/train`) for fine-tuning |
+| `TRAINING_PYTHON` | this Python (`/opt/train/bin/python` in Docker) | The Python that fine-tunes: needs torch and transformers |
+| `TRAINING_DIR` | `./data/training` | Training runs, their logs and the fine-tuned models |
+| `TRAINING_THREADS` | `0` (PyTorch decides) | PyTorch's threads while training |
+| `TRAINING_WORK_DIR` | the system's temp dir | Intermediate checkpoints (deleted after the run) |
 
 ## Docker and Render
 
@@ -342,7 +396,8 @@ docker run -p 10000:10000 -e API_TOKEN=secret audio-transcript
 The Dockerfile exports Whisper to ONNX in a throwaway build stage (torch never reaches the runtime
 image), so the container needs no downloads at boot. To compare other models in the Benchmark tab,
 export them into the image too: `--build-arg BENCHMARK_MODELS="openai/whisper-base.en openai/whisper-small.en"`.
-Mount a volume at `/data` to keep the benchmark's recordings, clips and runs.
+Mount a volume at `/data` to keep the benchmark's recordings, clips and runs, and the fine-tuned models
+(`--build-arg TRAINING=true`: see Fine-tuning).
 
 `render.yaml` is a Render Blueprint for the same image: **New → Blueprint**, pick this repository,
 then copy the generated `API_TOKEN` from the service's **Environment** tab. A 1 GB disk at `/data` keeps

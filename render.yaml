@@ -55,6 +55,11 @@ services:
       # (512 MB) compare at most tiny models; use standard (2 GB) for base.en or small.en.
       - key: BENCHMARK_MODELS
         value: ""
+      # "true": fine-tuning on the benchmark set (the podcast app's Training tab): PyTorch and transformers in the
+      # image (+1 GB) and the model's PyTorch weights. Training whisper-tiny.en needs about 2-3 GB of memory (pro,
+      # 4 GB; not starter) and each fine-tuned model ~250 MB of the disk. On a CPU, keep runs to a few hundred steps.
+      - key: TRAINING
+        value: "false"
       # Match ONNX Runtime's thread pools to the plan's CPUs (starter/standard = 1, pro = 2).
       - key: ONNX_THREADS
         value: "1"
