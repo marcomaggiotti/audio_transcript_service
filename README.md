@@ -10,9 +10,10 @@ The speech-recognition code is taken from
 export, NumPy log-mel features, greedy decoding with Whisper's timestamp rules, audio decoding).
 This service keeps only that part. It has no search or embeddings.
 
-The default model is **`openai/whisper-tiny.en`**: English only, and more accurate on English than the
-multilingual `openai/whisper-tiny` of the same size. For other languages, pick `whisper-small` per job
-(`model=`, shipped through `EXTRA_MODELS`) or make `openai/whisper-tiny` the default (`WHISPER_MODEL`).
+**English only.** The service runs English-only Whisper models (`openai/whisper-*.en`), by default
+**`openai/whisper-tiny.en`**: their prompt is just `<|startoftranscript|>`, with no language to choose or detect.
+A multilingual export is refused when it loads, and left out of `MODELS_DIR`. Responses still carry
+`"language": "en"` (transcripts) and `"languages": ["en"]` (`/health`) for clients that read them.
 
 ```
  POST /transcribe ─────────────► queue ─► ffmpeg decode → 16 kHz mono
@@ -25,7 +26,7 @@ multilingual `openai/whisper-tiny` of the same size. For other languages, pick `
 
 | Area | Implementation |
 |---|---|
-| Speech recognition | Whisper exported to ONNX (fp32 encoder, INT8 KV-cache decoder: an INT8 encoder garbles real speech, see `scripts/export_whisper_onnx.py`). Whisper's timestamp rules, 30 s windows with seek, language auto-detect, temperature fallback, previous-text and initial prompts (`app/asr.py`) |
+| Speech recognition | Whisper exported to ONNX (fp32 encoder, INT8 KV-cache decoder: an INT8 encoder garbles real speech, see `scripts/export_whisper_onnx.py`). Whisper's timestamp rules, 30 s windows with seek, temperature fallback, previous-text and initial prompts (`app/asr.py`) |
 | Features | Whisper log-mel spectrogram in pure NumPy, no torch or librosa at runtime (`app/features.py`) |
 | Audio | Magic-byte format check, ffmpeg decoding to 16 kHz mono with a pure-Python WAV fallback (`app/audio.py`) |
 | Jobs | In-process asyncio queue with bounded concurrency. Synchronous requests use the same queue (`app/jobs.py`) |
@@ -38,14 +39,13 @@ multilingual `openai/whisper-tiny` of the same size. For other languages, pick `
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/transcribe?format=json\|text\|srt\|vtt` | Multipart `file` (WAV, MP3, OGG/Opus, M4A, FLAC) and optional `language` (`en`, `de`, `it`, … or `auto`), `temperature_fallback`, `condition_on_previous_text`, `reset_on_loop`, `vad` (`true`/`false`), `vad_threshold`, `vad_min_silence_ms`, `beam_size`, `kv_cache`, `initial_prompt` and `intervals`. Waits and returns the transcript |
+| `POST` | `/transcribe?format=json\|text\|srt\|vtt` | Multipart `file` (WAV, MP3, OGG/Opus, M4A, FLAC) and optional `temperature_fallback`, `condition_on_previous_text`, `reset_on_loop`, `vad` (`true`/`false`), `vad_threshold`, `vad_min_silence_ms`, `beam_size`, `initial_prompt` and `intervals`. Waits and returns the transcript |
 | `POST` | `/jobs` | Same upload, transcribed in the background. Returns `202` with the job id, `status_url` and `transcript_url` |
 | `GET` | `/jobs` | Recent jobs, newest first |
 | `GET` | `/jobs/{id}` | Status, `stage` (decoding, transcribing), `progress` (0–1, updated after each 30 s window), `queue_position` while queued, model, timings and metrics, or the error if it failed |
 | `GET` | `/jobs/{id}/transcript?format=` | The transcript. `409` until it's ready, `422` if the job failed |
-| `DELETE` | `/jobs/{id}` | Forget a job (and its upload if it's still queued) |
+| `DELETE` | `/jobs/{id}` | Cancel a job: a queued one never runs, a running one stops at its next decoder step (CTranslate2: next segment), so the worker moves on to the next job |
 | `GET` | `/config` | How audio becomes text here: decoding, windows, log-mel features (fixed by Whisper) and the model, its encoder/decoder precision (read from the ONNX graphs) and decoding defaults |
-| `GET` | `/languages` | Languages the loaded model supports, and the default |
 | `GET` | `/health` | Model status, queue depth, active jobs |
 | `GET` | `/healthz` | Liveness: `503` if the speech model didn't load |
 | | `/benchmark/…`, `/benchmarks` | The benchmark: see [below](#benchmark-word-error-rate-on-your-own-audio) |
@@ -54,8 +54,8 @@ multilingual `openai/whisper-tiny` of the same size. For other languages, pick `
 # Plain text, waiting for the result
 curl -F file=@episode.mp3 "localhost:8000/transcribe?format=text"
 
-# Subtitles in Italian: the default whisper-tiny.en only does English, so pick a multilingual model
-curl -F file=@clip.m4a -F language=it -F model=openai/whisper-small "localhost:8000/transcribe?format=srt" -o clip.srt
+# Subtitles
+curl -F file=@clip.m4a "localhost:8000/transcribe?format=srt" -o clip.srt
 
 # Long file: queue it, poll, fetch
 curl -F file=@talk.mp3 localhost:8000/jobs               # {"id": "…", "status": "queued", …}
@@ -93,12 +93,22 @@ options follow openai/whisper:
   below −1) is decoded again, sampling at temperatures 0.2, 0.4 … 1.0, until it passes. A window Whisper
   thinks is silence (no-speech probability above 0.6, text unsure) gives no text at all. This fixes most
   hallucinations and repetition loops, at the cost of extra decoding on bad windows only.
-- **Previous-text prompt** (`CONDITION_ON_PREVIOUS_TEXT`, `condition_on_previous_text`): each window is
-  prompted with the text decoded before it (up to 223 tokens), which keeps names and spelling consistent.
+- **Previous-text prompt** (`CONDITION_ON_PREVIOUS_TEXT`, `condition_on_previous_text`, **off by default**): each
+  window is prompted with the text decoded before it (up to 223 tokens), which keeps names and spelling consistent,
+  but a window transcribed wrongly then misleads the next one. This is the setting that reuses earlier words.
   It's dropped after a window that needed a high temperature, and (`RESET_PROMPT_ON_LOOP`, `reset_on_loop`,
   on by default) after a window whose text loops (compression ratio above 2.4), so one mistake doesn't spread
   and a loop doesn't snowball into the next window. The window trace marks such a window `prompt_reset`. With a
-  small model such as whisper-tiny, turning previous text off altogether is often better: measure it.
+  small model such as whisper-tiny.en, turning previous text off altogether is often better: measure it.
+- **KV cache** (`KV_CACHE`, `kv_cache`, on by default; Transcribe and Benchmark tabs: "KV cache (faster)"):
+  Whisper writes a window one word-piece at a time, each step reading every piece written so far. With the cache,
+  the decoder keeps its intermediate results (keys and values) for the pieces already read, so a step only
+  computes the new one; without it, every step recomputes them all. That is a speed-up only: either way each step
+  sees exactly the same words, right or wrong, and a mistake is not "kept" any more by the cache than without it.
+  The transcript is the same (with the int8 decoder, rounding can very rarely change a word: compare both in the
+  Benchmark tab). Off, each step also recomputes the attention keys and values of all 1500 encoder frames: about
+  10x the decoder work, times the beams with beam search. On Render's 0.5 CPU a 2-minute recording with beam 5 took
+  over 12 minutes that way, so keep it on unless you are comparing. The CTranslate2 engine always uses its own cache.
 - **Beam search** (`BEAM_SIZE`, `beam_size`, default 1 = greedy, up to 8): at temperature 0 the decoder keeps that
   many candidate texts in parallel and picks the one with the best mean log-probability per token, as openai/whisper
   does with 5. Usually noticeably fewer word errors, more so on a weak model; the decoder is about 3-5x slower (the
@@ -155,7 +165,7 @@ Speed tells you little about which model to use; accuracy on *your* audio does. 
    give a stable score. You can also import clips you cut yourself, with their transcripts.
 2. **Reference clips** lists the set. Transcripts can be edited in place; unticked clips are skipped.
 3. **Run** with any models and decoding variants (greedy, temperature fallback, fallback + previous
-   text), a language and an optional initial prompt. Runs go through the transcription queue, so they
+   text) and an optional initial prompt. Runs go through the transcription queue, so they
    never run at the same time as a job.
 4. **Results** shows WER, substitutions, deletions and insertions, real-time factor, peak memory and
    load time for each combination, with the lowest WER highlighted. Click a row for every clip's
@@ -173,7 +183,7 @@ python scripts/export_whisper_onnx.py --model openai/whisper-base.en --output mo
 ```
 
 The service's own model stays loaded; another model is loaded for its part of a run and freed
-afterwards, so a run needs room for both (whisper-base with tiny: about +150 MB).
+afterwards, so a run needs room for both (whisper-base.en next to tiny.en: about +150 MB).
 
 **On disk** (`BENCHMARK_DIR`, default `./data/benchmark`): recordings in `sources/`, reference clips in
 `clips/` as `<id>.wav` + `<id>.txt` (the correct transcript) + `<id>.json`, and finished runs in `runs/`.
@@ -183,26 +193,26 @@ references, including the Benchmark tab's `clips/` folder:
 
 ```bash
 python scripts/wer.py data/benchmark/clips --model-dir models/whisper-tiny.en --model-dir models/whisper-base.en \
-    --language en --details
+    --details
 ```
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/benchmark/sources` | Upload a recording (`file`, `language`); Whisper proposes its segments |
+| `POST` | `/benchmark/sources` | Upload a recording (`file`); Whisper proposes its segments |
 | `GET` | `/benchmark/sources`, `/benchmark/sources/{id}` | Recordings; one with its proposed segments |
 | `GET` | `/benchmark/sources/{id}/audio` | The recording |
-| `POST` | `/benchmark/sources/{id}/transcribe?language=` | Propose segments again, e.g. in another language |
+| `POST` | `/benchmark/sources/{id}/transcribe` | Propose segments again, e.g. after changing the decoding defaults |
 | `DELETE` | `/benchmark/sources/{id}` | Delete a recording (its clips stay) |
 | `POST` | `/benchmark/clips` | `{"source_id", "start", "end", "reference", "name"}`: cut an interval into a reference clip |
 | `POST` | `/benchmark/clips/upload` | Multipart `file`, `reference`, `name`: a clip you cut yourself |
 | `GET` / `PATCH` / `DELETE` | `/benchmark/clips[/{id}]` | List, edit the transcript or name, delete |
 | `GET` | `/benchmark/clips/{id}/audio` | The clip as 16 kHz WAV |
 | `GET` | `/benchmark/models`, `/benchmark/variants` | What a run can compare |
-| `POST` | `/benchmarks` | `{"models", "variants", "language", "initial_prompt", "clip_ids"}`: queue a run (`202`) |
+| `POST` | `/benchmarks` | `{"models", "variants", "initial_prompt", "clip_ids", "kv_cache"}`: queue a run (`202`) |
 | `GET` | `/benchmarks`, `/benchmarks/{id}` | Runs with progress and results; one run with per-clip diffs |
 | `DELETE` | `/benchmarks/{id}` | Delete a finished run |
 
-When `API_TOKEN` is set, `/transcribe`, `/jobs`, `/languages`, `/benchmark/…` and `/benchmarks` need
+When `API_TOKEN` is set, `/transcribe`, `/jobs`, `/benchmark/…` and `/benchmarks` need
 `X-API-Key: <token>` or `Authorization: Bearer <token>`. The web page asks for the token once (top
 right). The page itself, `/health`, `/healthz` and the API docs (`/docs`) stay public.
 
@@ -248,23 +258,24 @@ is reset when the job starts, on Linux), so jobs can be compared one by one.
 
 ### Model per job
 
-Besides its own model (`WHISPER_MODEL`, loaded at start), the image can hold more (`EXTRA_MODELS`, e.g.
-`openai/whisper-small`, exported with only the recommended precision pair). `POST /jobs` and `POST /transcribe`
-take `model=openai/whisper-small` (or `whisper-small`); the job records the model used (`model`). Another model
+Besides its own model (`WHISPER_MODEL`, loaded at start), the image can hold more English-only ones
+(`EXTRA_MODELS`, e.g. `openai/whisper-base.en`, exported with only the recommended precision pair). `POST /jobs` and
+`POST /transcribe` take `model=openai/whisper-base.en` (or `whisper-base.en`); the job records the model used
+(`model`). Another model
 is loaded for the job and released after it, like a non-default precision, so at most one extra model is in
 memory; its load time is reported apart (`metrics.load_seconds`).
 
-Before queuing, the service checks the model exists, can transcribe the language (an `.en` model only does
-English), has the precisions asked for, and fits in the container's memory: its files × 1.3 + 150 MB, next
+Before queuing, the service checks the model exists, has the precisions asked for, and fits in the container's
+memory: its files × 1.3 + 150 MB, next
 to what the process already holds, within 90% of the cgroup limit (`MEMORY_LIMIT_MB` overrides it). A model
 that doesn't fit is refused with `422` and the reason, instead of the process being killed. `GET /config`
-lists the models (`models`: precisions, languages, `needs_mb`, `fits`, `reason`) and `memory_limit_mb`.
+lists the models (`models`: precisions, `needs_mb`, `fits`, `reason`) and `memory_limit_mb`.
 
-| Model | Size | Italian | Memory while transcribing | Render plan |
-|---|---|---|---|---|
-| whisper-tiny.en (default) | 39 M parameters | no: English only | ~300 MB | starter (512 MB) |
-| whisper-tiny | 39 M parameters | usable on clear speech | ~300 MB | starter (512 MB) |
-| whisper-small | 244 M parameters | much better | ~1 GB, next to tiny | standard (2 GB) |
+| Model | Size | Memory while transcribing | Render plan |
+|---|---|---|---|
+| whisper-tiny.en (default) | 39 M parameters | ~300 MB | starter (512 MB) |
+| whisper-base.en | 74 M parameters | between the two (not measured yet) | standard (2 GB) |
+| whisper-small.en | 244 M parameters | ~1 GB, next to tiny.en | standard (2 GB) |
 
 ## Run locally
 
@@ -283,10 +294,9 @@ open http://localhost:8000          # web page; API docs at /docs
 Without a model directory the service still starts in `degraded` mode: `/health` says why, and
 transcription requests get `503`.
 
-Any Whisper checkpoint on Hugging Face works: the multilingual `openai/whisper-tiny`, `openai/whisper-base`
-or `openai/whisper-small`, or the English-only `openai/whisper-base.en`. Larger models are more accurate but
-slower and use more RAM. An English-only model ignores `language` and reports `en`; asking it for another
-language gets `422`.
+Any English-only Whisper checkpoint on Hugging Face works: `openai/whisper-tiny.en`, `openai/whisper-base.en`,
+`openai/whisper-small.en` or `openai/whisper-medium.en`. Larger models are more accurate but slower and use more
+RAM. A multilingual one (`openai/whisper-tiny`, ...) is refused when it loads.
 
 Tests use a fake Whisper, so they need no model download:
 
@@ -300,18 +310,18 @@ pytest
 |---|---|---|
 | `WHISPER_MODEL_DIR` | `./models/whisper-tiny.en` | Output of `scripts/export_whisper_onnx.py` |
 | `WHISPER_MODEL` | `openai/whisper-tiny.en` | Build arg (Docker, Render): the model exported as the service's own |
-| `DEFAULT_LANGUAGE` | `auto` | Used when a request doesn't specify one; `auto` detects it |
 | `MAX_NEW_TOKENS` | `224` | Decoder tokens per 30 s window |
 | `ONNX_THREADS` | `0` (auto) | ONNX Runtime threads; set to the instance's CPU count |
 | `WHISPER_LOW_MEMORY` | `false` | About 25 MB less RAM, about 1.5x slower transcription |
-| `TEMPERATURE_FALLBACK` / `CONDITION_ON_PREVIOUS_TEXT` | `true` / `true` | Decoding defaults; requests can override them |
+| `TEMPERATURE_FALLBACK` / `CONDITION_ON_PREVIOUS_TEXT` | `true` / `false` | Decoding defaults; requests can override them |
+| `KV_CACHE` | `true` | Decoder KV cache: same transcript, about 10x less decoder work; requests can override it |
 | `BEAM_SIZE` / `RESET_PROMPT_ON_LOOP` | `1` / `true` | Beam search width (1 = greedy); stop carrying text after a loop |
 | `VAD` / `VAD_THRESHOLD` / `VAD_MIN_SILENCE_MS` | `false` / `0.5` / `500` | Voice activity detection defaults; requests can override them |
 | `KV_CACHE` | `true` | The decoder's KV cache (one new token per step); `false` re-runs the whole prefix every step. Requests can override it (`kv_cache`) |
 | `VAD_MODEL_PATH` | `./models/vad/silero_vad.onnx` | Silero VAD model (the Docker image has it) |
 | `INITIAL_PROMPT` | – | Default initial prompt (names, terms) |
 | `MODELS_DIR` | `./models` | Exports jobs can choose (`model=`) and the benchmark can compare |
-| `EXTRA_MODELS` | – | Build arg: more models exported into the image for jobs, e.g. `openai/whisper-small` |
+| `EXTRA_MODELS` | – | Build arg: more English-only models exported into the image for jobs, e.g. `openai/whisper-base.en` |
 | `MEMORY_LIMIT_MB` | the cgroup limit | Memory the "does this model fit" check plans with |
 | `BENCHMARK_DIR` | `./data/benchmark` | Recordings, reference clips and runs |
 | `MAX_CLIP_SECONDS` | `300` | Longest reference clip |
@@ -325,25 +335,25 @@ pytest
 
 ```bash
 docker build -t audio-transcript .                    # whisper-tiny.en
-docker build -t audio-transcript --build-arg WHISPER_MODEL=openai/whisper-tiny .   # multilingual
+docker build -t audio-transcript --build-arg WHISPER_MODEL=openai/whisper-base.en .
 docker run -p 10000:10000 -e API_TOKEN=secret audio-transcript
 ```
 
 The Dockerfile exports Whisper to ONNX in a throwaway build stage (torch never reaches the runtime
 image), so the container needs no downloads at boot. To compare other models in the Benchmark tab,
-export them into the image too: `--build-arg BENCHMARK_MODELS="openai/whisper-base openai/whisper-small"`.
+export them into the image too: `--build-arg BENCHMARK_MODELS="openai/whisper-base.en openai/whisper-small.en"`.
 Mount a volume at `/data` to keep the benchmark's recordings, clips and runs.
 
 `render.yaml` is a Render Blueprint for the same image: **New → Blueprint**, pick this repository,
 then copy the generated `API_TOKEN` from the service's **Environment** tab. A 1 GB disk at `/data` keeps
 the benchmark set across deploys. To change model size, edit `WHISPER_MODEL` in `render.yaml` and push;
 it's passed to the Docker build, like `BENCHMARK_MODELS`. On the 512 MB starter plan, comparing a second
-model next to whisper-tiny may run out of memory: use `standard` for benchmarks with whisper-base or larger.
+model next to whisper-tiny.en may run out of memory: use `standard` for benchmarks with whisper-base.en or larger.
 
 ## Speed benchmark
 
 ```bash
-python scripts/benchmark.py sample.mp3 --model-dir models/whisper-tiny --runs 3
+python scripts/benchmark.py sample.mp3 --model-dir models/whisper-tiny.en --runs 3
 ```
 
 It prints inference latency, real-time factor and peak memory on this machine.

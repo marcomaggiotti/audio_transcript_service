@@ -22,8 +22,6 @@ class Settings(BaseModel):
 
     # Speech recognition (Whisper exported to ONNX, see scripts/export_whisper_onnx.py)
     whisper_model_dir: str = _env("WHISPER_MODEL_DIR", "./models/whisper-tiny.en")
-    # Used when a request doesn't specify one; "auto" detects the language from the first window.
-    default_language: str = _env("DEFAULT_LANGUAGE", "auto")
     max_new_tokens: int = int(_env("MAX_NEW_TOKENS", "224"))
     onnx_threads: int = int(_env("ONNX_THREADS", "0"))  # 0 = let ONNX Runtime decide
     # The CTranslate2 conversion of the same model (export --ct2), for jobs with engine=ctranslate2.
@@ -33,7 +31,12 @@ class Settings(BaseModel):
     # Decoding defaults (a request can override them): openai/whisper's temperature fallback, and
     # prompting each 30 s window with the text before it. INITIAL_PROMPT: vocabulary/style hint.
     temperature_fallback: bool = _flag("TEMPERATURE_FALLBACK", "true")
-    condition_on_previous_text: bool = _flag("CONDITION_ON_PREVIOUS_TEXT", "true")
+    # Off by default: a wrongly transcribed window would be fed to the next one as its prompt.
+    condition_on_previous_text: bool = _flag("CONDITION_ON_PREVIOUS_TEXT", "false")
+    # Decoder KV cache: a speed-up only (the same tokens either way). KV_CACHE=false re-runs the decoder over the
+    # whole text at every step: about 10x the decoder work, times the beams with beam search; on 0.5 CPU a job could
+    # take tens of minutes and hold the queue, so it is on by default.
+    kv_cache: bool = _flag("KV_CACHE", "true")
     initial_prompt: str | None = _env("INITIAL_PROMPT")
     # Beam search at temperature 0 (1 = greedy; openai/whisper uses 5): fewer word errors, decoder ~3-5x slower.
     beam_size: int = int(_env("BEAM_SIZE", "1"))

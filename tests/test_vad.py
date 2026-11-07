@@ -60,12 +60,12 @@ class PieceTranscriber:
     def __init__(self):
         self.lengths, self.prompts = [], []
 
-    def transcribe(self, audio, language=None, on_progress=None, options=None):
+    def transcribe(self, audio, on_progress=None, options=None):
         seconds = round(audio.shape[0] / SR, 2)
         self.lengths.append(seconds)
         self.prompts.append(options.initial_prompt)
         text = "hello " * 40 if seconds == 4.0 else f"piece of {seconds}"
-        return TranscriptionResult(language=language or "it", segments=[Segment(0.0, seconds, text.strip(), -0.2)],
+        return TranscriptionResult(segments=[Segment(0.0, seconds, text.strip(), -0.2)],
                                    windows=[WindowTrace(0.0, seconds, seconds, 0.01, False, 1)])
 
 
@@ -74,19 +74,19 @@ def test_only_the_speech_is_transcribed_and_times_map_back():
     vad = ScriptedVad([(2.0, 12.0), (20.0, 30.0), (31.0, 41.0), (50.0, 54.0)])
     t = PieceTranscriber()
     shares = []
-    result = transcribe_speech(t, vad, audio, None, shares.append,
+    result = transcribe_speech(t, vad, audio, shares.append,
                                DecodingOptions(vad=True, vad_threshold=0.6, vad_min_silence_ms=800))
     assert vad.calls == [(0.6, 800)]
     assert t.lengths == [20.0, 14.0]  # silence left out: 10 s + 10 s, then 10 s + 4 s
     # A piece's segment covers its speech: from its first stretch's start to its last one's end.
     assert [(s.start, s.end) for s in result.segments] == [(2.0, 30.0), (31.0, 54.0)]
     assert [w.start for w in result.windows] == [2.0, 31.0]
-    assert result.speech == vad.spans and result.language == "it" and shares[-1] == 1.0
+    assert result.speech == vad.spans and shares[-1] == 1.0
 
 
 def test_no_speech_no_transcription():
     t = PieceTranscriber()
-    result = transcribe_speech(t, ScriptedVad([]), np.zeros(10 * SR, dtype=np.int16), "en", None,
+    result = transcribe_speech(t, ScriptedVad([]), np.zeros(10 * SR, dtype=np.int16), None,
                                DecodingOptions(vad=True))
     assert t.lengths == [] and result.segments == [] and result.speech == []
 
@@ -94,7 +94,7 @@ def test_no_speech_no_transcription():
 def test_previous_text_carries_between_pieces():
     t = PieceTranscriber()
     vad = ScriptedVad([(0.0, 20.0), (25.0, 30.0), (35.0, 45.0)])  # 20 + 5 s, then 10 s
-    transcribe_speech(t, vad, np.zeros(60 * SR, dtype=np.int16), "en", None,
+    transcribe_speech(t, vad, np.zeros(60 * SR, dtype=np.int16), None,
                       DecodingOptions(vad=True, condition_on_previous_text=True, initial_prompt="Aipollo"))
     assert t.lengths == [25.0, 10.0]
     assert t.prompts == ["Aipollo", "Aipollo piece of 25.0"]
@@ -104,7 +104,7 @@ def test_a_looping_piece_is_not_prompted_to_the_next():
     audio = np.zeros(80 * SR, dtype=np.int16)
     t = PieceTranscriber()
     vad = ScriptedVad([(0.0, 4.0), (30.0, 58.0), (60.0, 70.0)])  # 4 s (loops) + nothing fits after: 28 s piece
-    result = transcribe_speech(t, vad, audio, "en", None, DecodingOptions(vad=True, condition_on_previous_text=True))
+    result = transcribe_speech(t, vad, audio, None, DecodingOptions(vad=True, condition_on_previous_text=True))
     assert t.lengths == [4.0, 28.0, 10.0]
     assert t.prompts == [None, None, "piece of 28.0"]
     assert result.windows[0].prompt_reset

@@ -71,7 +71,7 @@ class CT2Engine:
         return WhisperModel(str(self.path), device="cpu", compute_type=compute_type or "int8", cpu_threads=self.threads,
                             local_files_only=True)
 
-    def transcribe(self, model, audio: np.ndarray, language: str | None = None, options: DecodingOptions | None = None,
+    def transcribe(self, model, audio: np.ndarray, options: DecodingOptions | None = None,
                    on_progress=None) -> TranscriptionResult:
         """Transcribe 16 kHz mono audio (int16 or float32) with the job's decoding options."""
         options = options or DecodingOptions()
@@ -80,8 +80,8 @@ class CT2Engine:
         vad = {k: v for k, v in (("threshold", options.vad_threshold),
                                   ("min_silence_duration_ms", options.vad_min_silence_ms)) if v is not None} or None
         try:
-            pieces, info = model.transcribe(
-                samples, language=language, task="transcribe", beam_size=max(1, options.beam_size or 1),
+            pieces, _info = model.transcribe(
+                samples, language="en", task="transcribe", beam_size=max(1, options.beam_size or 1),
                 temperature=list(FALLBACK_TEMPERATURES) if options.temperature_fallback else 0.0,
                 condition_on_previous_text=bool(options.condition_on_previous_text),
                 initial_prompt=options.initial_prompt or None, vad_filter=bool(options.vad), vad_parameters=vad)
@@ -95,4 +95,4 @@ class CT2Engine:
         finally:
             del model  # the caller passes its only reference: the weights are freed here
             _release_memory()
-        return TranscriptionResult(language=getattr(info, "language", None) or language, segments=segments)
+        return TranscriptionResult(segments=segments)

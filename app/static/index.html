@@ -128,12 +128,14 @@ tr.clickable:hover td { background: var(--accent-soft); }
 <div id="tab-transcribe">
   <section class="panel">
     <h2>Transcribe a recording</h2>
-    <p class="hint">WAV, MP3, OGG/Opus, M4A or FLAC. Setting the language helps: auto-detect only listens to the first 30 seconds.</p>
+    <p class="hint">WAV, MP3, OGG/Opus, M4A or FLAC, in English: the service runs English-only Whisper models.</p>
     <form id="transcribeForm" class="row">
       <label>Audio<input type="file" name="file" accept="audio/*,.ogg,.opus,.m4a,.flac" required></label>
-      <label>Language<select name="language" class="languages"></select></label>
       <label class="check"><input type="checkbox" name="temperature_fallback" checked> Temperature fallback</label>
-      <label class="check"><input type="checkbox" name="condition_on_previous_text" checked> Previous-text prompt</label>
+      <label class="check" title="Give each 30 s window the text of the one before as a hint. A wrong window then misleads the next one.">
+        <input type="checkbox" name="condition_on_previous_text"> Previous-text prompt</label>
+      <label class="check" title="Speed only: the decoder keeps its work on the words already written instead of redoing it at every step. The transcript is the same.">
+        <input type="checkbox" name="kv_cache"> KV cache (faster)</label>
       <label style="flex:1 1 220px">Initial prompt (names, terms)<input type="text" name="initial_prompt" placeholder="ONNX Runtime, Whisper, Render"></label>
       <button class="primary" type="submit">Transcribe</button>
     </form>
@@ -166,7 +168,6 @@ tr.clickable:hover td { background: var(--accent-soft); }
       20–30 clips across speakers and conditions give a reliable score.</p>
     <form id="sourceForm" class="row">
       <label>Recording<input type="file" name="file" accept="audio/*,.ogg,.opus,.m4a,.flac" required></label>
-      <label>Language<select name="language" class="languages"></select></label>
       <button class="primary" type="submit">Upload and propose intervals</button>
     </form>
     <div class="sources" id="sources"></div>
@@ -250,8 +251,8 @@ tr.clickable:hover td { background: var(--accent-soft); }
       <div><strong style="font-size:14px">Decoding</strong><div id="variants" style="margin-top:6px;display:grid;gap:4px"></div></div>
     </div>
     <div class="row" style="margin-top:14px">
-      <label>Language<select id="runLanguage" class="languages"></select></label>
       <label style="flex:1 1 260px">Initial prompt (optional)<input type="text" id="runPrompt" placeholder="names and terms that occur in the audio"></label>
+      <label class="check" title="Speed only: the same transcripts, several times faster"><input type="checkbox" id="runKvCache"> KV cache (faster)</label>
       <button class="primary" id="runBenchmark">Run benchmark</button>
     </div>
     <div class="error" id="runError"></div>
@@ -330,21 +331,20 @@ function showTab(name) {
 }
 $$("nav button").forEach(b => b.onclick = () => showTab(b.dataset.tab));
 
-// ----------------------------------------------------------------- health + languages
-let defaultLanguage = "auto";
+// ----------------------------------------------------------------- health
 async function refreshHealth() {
   try {
     const health = await api("/health");
     $("#health").textContent = health.status === "ok" ? `${health.model} · queue ${health.queue_depth}` : `degraded: ${health.model_error}`;
-    const langs = await api("/languages");
-    defaultLanguage = langs.default;
-    for (const select of $$("select.languages")) {
-      const current = select.value;
-      select.replaceChildren(h("option", { value: "auto" }, "auto-detect"),
-        ...langs.languages.map(l => h("option", { value: l }, l)));
-      select.value = current || langs.default || "auto";
-    }
   } catch (e) { $("#health").textContent = e.message; }
+  try { // tick the decoding options the way the service defaults them (TEMPERATURE_FALLBACK, KV_CACHE, ...)
+    const { decoding } = await api("/config");
+    const form = $("#transcribeForm");
+    form.temperature_fallback.checked = decoding.temperature_fallback;
+    form.condition_on_previous_text.checked = decoding.condition_on_previous_text;
+    form.kv_cache.checked = decoding.kv_cache;
+    $("#runKvCache").checked = decoding.kv_cache;
+  } catch { /* older service, or no token yet: keep the page's defaults */ }
 }
 
 // ----------------------------------------------------------------- transcribe tab
@@ -354,9 +354,9 @@ $("#transcribeForm").onsubmit = async ev => {
   const form = ev.target, data = new FormData();
   const file = form.file.files[0];
   data.append("file", file);
-  data.append("language", form.language.value);
   data.append("temperature_fallback", form.temperature_fallback.checked);
   data.append("condition_on_previous_text", form.condition_on_previous_text.checked);
+  data.append("kv_cache", form.kv_cache.checked);
   if (form.initial_prompt.value.trim()) data.append("initial_prompt", form.initial_prompt.value.trim());
   if (localUrl) URL.revokeObjectURL(localUrl);
   localUrl = URL.createObjectURL(file);
@@ -386,7 +386,7 @@ $("#transcribeForm").onsubmit = async ev => {
 
 function showTranscript(t, job) {
   $("#resultBox").classList.remove("hidden");
-  $("#resultMeta").textContent = `${t.language || "?"} · ${clock(t.duration_seconds)} · ${t.model}`;
+  $("#resultMeta").textContent = `${clock(t.duration_seconds)} · ${t.model}`;
   const m = t.metrics;
   $("#resultMetrics").textContent = m ? `Transcribed in ${m.inference_seconds}s (real-time factor ${m.real_time_factor}), peak memory ${m.peak_memory_mb} MB.` : "";
   $("#resultSegments").replaceChildren(...t.segments.map(s =>
@@ -429,7 +429,7 @@ $("#sourceForm").onsubmit = async ev => {
   button.disabled = true;
   try {
     const s = await api("/benchmark/sources", { method: "POST", body: data });
-    form.reset(); form.language.value = defaultLanguage;
+    form.reset();
     await loadSources();
     openSource(s.id);
   } catch (e) { toast(e.message); }
@@ -572,8 +572,7 @@ $("#saveClip").onclick = async () => {
 };
 
 $("#retranscribe").onclick = async () => {
-  const language = $("#sourceForm").language.value;
-  try { await api(`/benchmark/sources/${source.id}/transcribe?language=${language}`, { method: "POST" }); openSource(source.id); }
+  try { await api(`/benchmark/sources/${source.id}/transcribe`, { method: "POST" }); openSource(source.id); }
   catch (e) { toast(e.message); }
 };
 $("#deleteSource").onclick = async () => {
@@ -648,7 +647,8 @@ $("#runBenchmark").onclick = async () => {
   if (!clipIds.length) { $("#runError").textContent = "Add (or tick) at least one reference clip."; return; }
   try {
     const run = await api("/benchmarks", { method: "POST", json: {
-      models, variants, language: $("#runLanguage").value, initial_prompt: $("#runPrompt").value.trim() || null, clip_ids: clipIds } });
+      models, variants, initial_prompt: $("#runPrompt").value.trim() || null, clip_ids: clipIds,
+      kv_cache: $("#runKvCache").checked } });
     currentRun = run.id;
     await loadRuns();
   } catch (e) { $("#runError").textContent = e.message; }
@@ -682,7 +682,7 @@ async function showRun(id, polled = false) {
   }
   if (run.error) view.push(h("p", { class: "error" }, run.error));
   view.push(h("p", { class: "muted", style: "font-size:13px" },
-    `${run.clip_ids.length} clips · language ${run.language}${run.initial_prompt ? ` · prompt “${run.initial_prompt}”` : ""}`));
+    `${run.clip_ids.length} clips${run.initial_prompt ? ` · prompt “${run.initial_prompt}”` : ""}`));
 
   const scored = run.results.filter(r => r.wer != null);
   // Highlight the lowest WER only when it actually beats something.
