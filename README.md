@@ -120,6 +120,20 @@ options follow openai/whisper:
   slower decoder, more so on long windows and with beam search. It's there to measure what the cache saves; the job's
   `metrics.kv_cache` says whether it was used. CTranslate2 always decodes with its cache, and an export with only
   `decoder_model.onnx` (no merged decoder) never has one; `GET /config` (`decoding.kv_cache.available`) says which.
+- **Graph optimization** (`ONNX_GRAPH_OPTIMIZATION`, `graph_optimization`, default `all`): ONNX Runtime rewrites
+  the graph when it opens a model. `basic` folds constants and removes redundant nodes; `extended` also fuses
+  operators (attention, LayerNorm, GELU, MatMul+Add); `layout` also lays the weights out for the CPU; `all` is all of
+  it; `disabled` runs the graph as exported. A job that asks for another level than the loaded one has the encoder
+  and decoder reopened at it for the job (the loaded ones released first, so memory doesn't double), then reopened at
+  the default. Its metrics give the level (`metrics.graph_optimization`) and how long opening the sessions took,
+  optimizing included (`metrics.session_seconds`); `GET /config` lists the levels (`engines.onnx.graph_optimization`).
+  Measured on a whisper-tiny-sized export (fp32, 30 s of speech, greedy, 2-CPU sandbox): disabled 8.1 s, basic 2.8 s,
+  extended 2.5 s, layout 2.2 s, all 2.4 s, the same text at every level; opening took 0.5 s (disabled) to 1 s.
+  Without optimization the decoder's many small steps are about 3x slower; above basic the gain is small, so keep
+  `all`. ONNX Runtime's transformer optimizer (`python -m onnxruntime.transformers.optimizer --model_type bart
+  --num_heads 6 --hidden_size 384`) fused GELU and LayerNorm on that encoder but ran no faster than `all` (127 vs
+  129 ms per window), and saving the optimized graph (`SessionOptions.optimized_model_filepath`) would only save the
+  ~1 s of opening, so the export doesn't do either; re-measure on a bigger model before adding them.
 - **Voice activity detection** (`VAD`, `vad`, off by default; `vad_threshold`, `vad_min_silence_ms`): Silero VAD
   (MIT licence, a 2 MB ONNX model at `VAD_MODEL_PATH`, put in the image by the Dockerfile) gives each 32 ms of audio
   a speech probability. Stretches of speech (padded by 200 ms, ended by a pause of at least `vad_min_silence_ms`,
@@ -366,6 +380,7 @@ pytest
 | `KV_CACHE` | `true` | Decoder KV cache: same transcript, about 10x less decoder work; requests can override it |
 | `BEAM_SIZE` / `RESET_PROMPT_ON_LOOP` | `1` / `true` | Beam search width (1 = greedy); stop carrying text after a loop |
 | `VAD` / `VAD_THRESHOLD` / `VAD_MIN_SILENCE_MS` | `false` / `0.5` / `500` | Voice activity detection defaults; requests can override them |
+| `ONNX_GRAPH_OPTIMIZATION` | `all` | ONNX Runtime graph optimization when a model opens: `disabled`, `basic`, `extended`, `layout`, `all`. Requests can ask for another (`graph_optimization`) |
 | `KV_CACHE` | `true` | The decoder's KV cache (one new token per step); `false` re-runs the whole prefix every step. Requests can override it (`kv_cache`) |
 | `VAD_MODEL_PATH` | `./models/vad/silero_vad.onnx` | Silero VAD model (the Docker image has it) |
 | `INITIAL_PROMPT` | – | Default initial prompt (names, terms) |

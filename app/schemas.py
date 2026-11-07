@@ -45,6 +45,10 @@ class InferenceMetrics(BaseModel):
     model_mb: float | None = Field(None, description="Size of the weights it ran with (the files of the precisions used)")
     kv_cache: bool | None = Field(None, description="Whether the decoder ran with its KV cache (CTranslate2 always "
                                                     "does; an export without a merged decoder never does)")
+    graph_optimization: str | None = Field(None, description="The ONNX Runtime graph optimization level it ran at "
+                                                             "(None: CTranslate2, or can't say)")
+    session_seconds: float | None = Field(None, description="Opening the encoder and decoder at that level (the graph "
+                                                            "optimization included): this job's, or the service's start")
 
 
 class WindowAttempt(BaseModel):
