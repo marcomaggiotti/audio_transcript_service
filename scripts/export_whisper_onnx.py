@@ -238,7 +238,7 @@ def smoke_test(output: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", default="openai/whisper-tiny.en",
-                        help="Hugging Face model id, e.g. openai/whisper-tiny (multilingual) or openai/whisper-base.en")
+                        help="Hugging Face id of an English-only model, e.g. openai/whisper-tiny.en or openai/whisper-base.en")
     parser.add_argument("--output", default="models/whisper-tiny.en")
     parser.add_argument("--quantize", choices=["decoder", "all", "none"], default="decoder",
                         help="INT8 weights for: the decoder only (default), encoder and decoder (smaller, but "

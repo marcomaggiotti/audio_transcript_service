@@ -15,7 +15,7 @@ from contextlib import nullcontext
 from collections.abc import Callable
 from pathlib import Path
 
-from app.asr import DecodingOptions, Transcriber
+from app.asr import Cancelled, DecodingOptions, Transcriber, cancel_check
 from app.audio import InvalidAudioError, decode_audio, duration_seconds
 from app.ct2 import CT2Engine
 from app.metrics import peak_memory_mb, reset_peak_memory
@@ -54,12 +54,9 @@ class TranscriptionService:
         self.jobs: OrderedDict[str, Job] = OrderedDict()
         self._finished: dict[str, asyncio.Event] = {}
         self._tasks: dict[str, Callable[[], None]] = {}  # queued work that isn't a transcription job
+        self._cancelled: set[str] = set()  # running jobs deleted: they stop at their next decoder step
         self._workers: list[asyncio.Task] = []
         self.active = 0  # jobs currently being transcribed
-
-    @property
-    def languages(self) -> list[str]:
-        return list(getattr(self.transcriber, "supported_languages", None) or [])
 
     def upload_path(self, job_id: str) -> Path:
         return self.upload_dir / job_id
@@ -114,8 +111,11 @@ class TranscriptionService:
         return list(reversed(self.jobs.values()))
 
     def delete(self, job_id: str) -> None:
-        """Forget a job; a queued one is skipped, a running one finishes and is discarded."""
-        self.get(job_id)
+        """Forget a job. A queued one is skipped; a running one stops at its next decoder step (CTranslate2: its next
+        segment), so the worker moves on to the next job instead of finishing work nobody will read."""
+        job = self.get(job_id)
+        if job.status == JobStatus.processing:
+            self._cancelled.add(job_id)
         del self.jobs[job_id]
         self._finished.pop(job_id, None)
         self.upload_path(job_id).unlink(missing_ok=True)
@@ -173,6 +173,23 @@ class TranscriptionService:
         job.status, job.started_at, job.stage = JobStatus.processing, utcnow(), "decoding"
         path = self.upload_path(job_id)
         reset_peak_memory()  # the peak reported is this job's (Linux), not the largest one so far
+
+        def check() -> None:
+            if job_id in self._cancelled:
+                raise Cancelled(f"Job {job_id} was cancelled")
+
+        token = cancel_check.set(check)  # this worker thread only: checked before every decoder step
+        try:
+            self._process(job, path, check)
+        except Cancelled:
+            logger.info("Stopped cancelled job %s", job_id)
+            path.unlink(missing_ok=True)
+        finally:
+            cancel_check.reset(token)
+            self._cancelled.discard(job_id)
+
+    def _process(self, job: Job, path, check: Callable[[], None]) -> None:
+        job_id = job.id
         try:
             if self.transcriber is None:
                 raise RuntimeError(f"Speech model unavailable: {self.transcriber_error or 'not loaded'}")
@@ -187,6 +204,7 @@ class TranscriptionService:
             job.stage = "transcribing"
 
             def progress(share: float) -> None:
+                check()  # also stops the CTranslate2 engine, between segments
                 job.progress = round(share, 3)
 
             options = DecodingOptions(temperature_fallback=job.temperature_fallback,
@@ -206,11 +224,13 @@ class TranscriptionService:
                 job.stage, job.model = "transcribing", self.ct2.name
                 job.precision = {"encoder": job.compute_type or "int8", "decoder": job.compute_type or "int8"}
                 weights_mb = self.ct2.size_mb()
-                result = self.ct2.transcribe(loaded.pop(), audio, job.language, options, progress)
-                extra = {"kv_cache": True}  # CTranslate2 always decodes with its KV cache
+                result = self.ct2.transcribe(loaded.pop(), audio, options, progress)
+                kv_cache = True  # CTranslate2 always decodes with its KV cache
             else:
                 result, t_load, weights_mb, extra = self._onnx(job, audio, options, progress, loading)
             t2 = time.perf_counter()
+        except Cancelled:
+            raise
         except Exception as e:
             logger.exception("Transcription failed for %s", job_id)
             job.error = str(e) or e.__class__.__name__
@@ -228,24 +248,23 @@ class TranscriptionService:
         with self.models.use(job.requested_model, on_load=loading) as transcriber:
             job.stage = "transcribing"
             # Only the speech (VAD), and one segment per requested interval, when the job asks for them.
-            def run(audio, language, on_progress, options, _t=transcriber):
-                return transcribe_with(_t, audio, language, on_progress, options, self.vad, job.intervals)
+            def run(audio, on_progress, options, _t=transcriber):
+                return transcribe_with(_t, audio, on_progress, options, self.vad, job.intervals)
+            t_load = time.perf_counter()  # inference is timed from here: loading isn't inference
             job.model = transcriber.name
             switch = getattr(transcriber, "precision_for", None)  # absent on test fakes
             optimize = getattr(transcriber, "optimization_for", None)
             graph = {"level": None, "session_seconds": None}
             if switch is None:
                 job.precision = getattr(transcriber, "precision", None)
-                t_load = time.perf_counter()  # inference is timed from here: loading isn't inference
-                result = run(audio, language=job.language, on_progress=progress, options=options)
+                result = run(audio, on_progress=progress, options=options)
             else:
                 # The graph optimization level first (it reopens the default precisions), then the precisions (opened
                 # at that level); inference is timed once both are in place.
                 with (optimize(job.graph_optimization) if optimize else nullcontext(graph)) as graph, \
                         switch(job.encoder_precision, job.decoder_precision) as used:
                     job.precision = used
-                    t_load = time.perf_counter()
-                    result = run(audio, language=job.language, on_progress=progress, options=options)
+                    result = run(audio, on_progress=progress, options=options)
             weights = getattr(transcriber, "weights_mb", lambda used: None)(job.precision)
             available = getattr(transcriber, "kv_cache_available", None)  # None: a test fake, can't say
         return result, t_load, weights, {"kv_cache": None if available is None else bool(available and options.kv_cache),
@@ -254,7 +273,6 @@ class TranscriptionService:
     def _finish(self, job: Job, result, seconds: float, t0: float, t1: float, t_load: float, t2: float,
                 weights_mb: float | None, extra: dict | None = None) -> None:
         job.transcript = Transcript(
-            language=result.language or job.language,
             duration_seconds=round(seconds, 2),
             text=result.text,
             segments=[TranscriptSegment(index=i, start=s.start, end=s.end, text=s.text,

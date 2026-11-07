@@ -54,8 +54,7 @@ MULTIPART_SLACK = 1024 * 1024  # form fields + boundaries on top of the file its
 STATIC_DIR = Path(__file__).parent / "static"
 UPLOAD_PATHS = ("/transcribe", "/jobs", "/benchmark/sources", "/benchmark/clips/upload")
 # Guarded when API_TOKEN is set. The web page, health checks and the API docs stay reachable.
-PROTECTED_PREFIXES = ("/transcribe", "/jobs", "/languages", "/benchmark", "/benchmarks", "/config")
-LANGUAGE_PATTERN = r"^([a-z]{2,3}|auto)$"
+PROTECTED_PREFIXES = ("/transcribe", "/jobs", "/benchmark", "/benchmarks", "/config")
 
 
 def _is_protected(path: str) -> bool:
@@ -177,11 +176,11 @@ def create_app(settings: Settings | None = None, components: Components | None =
         except JobNotFound:
             raise HTTPException(404, f"Job {job_id} not found")
 
-    def check_model(service: TranscriptionService, model: str | None, language: str,
+    def check_model(service: TranscriptionService, model: str | None,
                     encoder: str | None, decoder: str | None) -> None:
-        """The requested model exists, fits in memory and has the language and the precisions asked for."""
+        """The requested model exists, fits in memory and has the precisions asked for."""
         try:
-            info = service.models.check(model, None if language == "auto" else language)
+            info = service.models.check(model)
         except ModelUnavailable as e:
             raise HTTPException(422, str(e))
         if info.default:  # the loaded model knows its own precisions (test fakes have none)
@@ -216,15 +215,10 @@ def create_app(settings: Settings | None = None, components: Components | None =
                 raise HTTPException(422, f"CTranslate2 needs about {service.ct2.needs_mb():.0f} MB and this server has "
                                          f"about {max(free, 0):.0f} MB free of {limit:.0f} MB")
 
-    def check_ready(service: TranscriptionService, language: str | None, model: str | None = None) -> str:
-        """Fail early when nothing could be transcribed; return the language to use."""
+    def check_ready(service: TranscriptionService) -> None:
+        """Fail early when nothing could be transcribed."""
         if service.transcriber is None:
             raise HTTPException(503, f"Speech model unavailable: {service.transcriber_error or 'not loaded'}")
-        language = language or settings.default_language
-        # Another model's languages are checked with it (check_model): an English-only one has fewer.
-        if not model and language != "auto" and service.languages and language not in service.languages:
-            raise HTTPException(422, f"Unsupported language '{language}'; see GET /languages")
-        return language
 
     async def save_upload(file: UploadFile, path: Path) -> int:
         """Stream an upload to `path`, checking its format and size. Returns the size in bytes."""
@@ -248,7 +242,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
             raise
         return size
 
-    def submit_job(service: TranscriptionService, job_id: str, filename: str, size: int, language: str,
+    def submit_job(service: TranscriptionService, job_id: str, filename: str, size: int,
                    temperature_fallback: bool | None = None, condition_on_previous_text: bool | None = None,
                    initial_prompt: str | None = None, encoder: str | None = None,
                    decoder: str | None = None, model: str | None = None,
@@ -259,12 +253,13 @@ def create_app(settings: Settings | None = None, components: Components | None =
                    graph_optimization: str | None = None) -> Job:
         """Queue the audio at service.upload_path(job_id), with the default decoding options unless given."""
         job = Job(
-            id=job_id, filename=filename, size_bytes=size, language=None if language == "auto" else language,
+            id=job_id, filename=filename, size_bytes=size,
             temperature_fallback=(settings.temperature_fallback if temperature_fallback is None
                                   else temperature_fallback),
             condition_on_previous_text=(settings.condition_on_previous_text if condition_on_previous_text is None
                                         else condition_on_previous_text),
             initial_prompt=(initial_prompt or settings.initial_prompt or "").strip() or None,
+            kv_cache=settings.kv_cache if kv_cache is None else kv_cache,
             encoder_precision=encoder, decoder_precision=decoder,
             requested_model=service.models.find(model).id if model else None,
             intervals=intervals,
@@ -274,8 +269,6 @@ def create_app(settings: Settings | None = None, components: Components | None =
             vad_threshold=settings.vad_threshold if vad_threshold is None else vad_threshold,
             vad_min_silence_ms=settings.vad_min_silence_ms if vad_min_silence_ms is None else vad_min_silence_ms,
             engine=engine or "onnx", compute_type=compute_type if engine == "ctranslate2" else None,
-            kv_cache=settings.kv_cache if kv_cache is None else kv_cache,
-            graph_optimization=None if engine == "ctranslate2" else graph_optimization,  # None: as the model is loaded
         )
         if job.vad and service.vad is None and job.engine == "onnx":  # CTranslate2 has its own (faster-whisper's)
             raise HTTPException(503, "Voice activity detection is unavailable on this service: "
@@ -286,21 +279,20 @@ def create_app(settings: Settings | None = None, components: Components | None =
             raise HTTPException(503, str(e), headers={"Retry-After": "30"})
         return job
 
-    async def accept_upload(service: TranscriptionService, file: UploadFile, language: str | None,
-                            **options) -> Job:
+    async def accept_upload(service: TranscriptionService, file: UploadFile, **options) -> Job:
         """Validate and store the upload, then queue it as a job."""
         options["intervals"] = parse_intervals(options.get("intervals"))
-        language = check_ready(service, language, options.get("model"))
+        check_ready(service)
         if options.get("engine") == "ctranslate2":
             check_engine(service, "ctranslate2", options.get("compute_type"), options.get("model"),
                          options.get("encoder"), options.get("decoder"))
             options["model"] = None  # the service's own model, on the other engine
         else:
             check_engine(service, options.get("engine"), options.get("compute_type"), None, None, None)
-            check_model(service, options.get("model"), language, options.get("encoder"), options.get("decoder"))
+            check_model(service, options.get("model"), options.get("encoder"), options.get("decoder"))
         job_id = uuid.uuid4().hex
         size = await save_upload(file, service.upload_path(job_id))
-        return submit_job(service, job_id, file.filename or "audio", size, language, **options)
+        return submit_job(service, job_id, file.filename or "audio", size, **options)
 
     def parse_intervals(raw: str | None) -> list[tuple[float, float]] | None:
         """The `intervals` form field: a JSON list of [start, end] pairs in seconds, in order, not overlapping."""
@@ -340,8 +332,6 @@ def create_app(settings: Settings | None = None, components: Components | None =
                           transcript_url=f"/jobs/{job.id}/transcript")
 
     file_param = File(..., description="WAV, MP3, OGG/Opus, M4A or FLAC audio")
-    language_param = Form(None, pattern=LANGUAGE_PATTERN,
-                          description="ISO code such as en, de, fr, it; 'auto' to detect")
     format_param = Query(OutputFormat.json, description="json (segments + metadata), text, srt or vtt")
     fallback_param = Form(None, description="Re-decode windows whose text repeats or is unsure "
                                             "(default: TEMPERATURE_FALLBACK)")
@@ -389,7 +379,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
 
     @app.post("/transcribe", response_model=TranscriptResponse,
               responses={200: {"content": {"text/plain": {}, "application/x-subrip": {}, "text/vtt": {}}}})
-    async def transcribe(request: Request, file: UploadFile = file_param, language: str | None = language_param,
+    async def transcribe(request: Request, file: UploadFile = file_param,
                          format: OutputFormat = format_param, temperature_fallback: bool | None = fallback_param,
                          condition_on_previous_text: bool | None = previous_param,
                          initial_prompt: str | None = prompt_param, encoder: str | None = encoder_param,
@@ -402,7 +392,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          kv_cache: bool | None = kv_cache_param, graph_optimization: str | None = graph_param):
         """Upload audio and wait for its transcript. Shares the job queue, so it waits its turn."""
         service = service_of(request)
-        job = await accept_upload(service, file, language, temperature_fallback=temperature_fallback,
+        job = await accept_upload(service, file, temperature_fallback=temperature_fallback,
                                   condition_on_previous_text=condition_on_previous_text,
                                   initial_prompt=initial_prompt, encoder=encoder, decoder=decoder, model=model,
                                   intervals=intervals, beam_size=beam_size, reset_on_loop=reset_on_loop, vad=vad,
@@ -421,7 +411,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
     # ------------------------------------------------------------------- jobs
 
     @app.post("/jobs", response_model=JobSummary, status_code=202)
-    async def create_job(request: Request, file: UploadFile = file_param, language: str | None = language_param,
+    async def create_job(request: Request, file: UploadFile = file_param,
                          temperature_fallback: bool | None = fallback_param,
                          condition_on_previous_text: bool | None = previous_param,
                          initial_prompt: str | None = prompt_param, encoder: str | None = encoder_param,
@@ -436,7 +426,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
 
         `model` picks the speech model and `encoder` / `decoder` the precision of each part for this job (see
         GET /config for what this deployment has); anything not loaded is loaded for the job and released after."""
-        job = await accept_upload(service_of(request), file, language, temperature_fallback=temperature_fallback,
+        job = await accept_upload(service_of(request), file, temperature_fallback=temperature_fallback,
                                   condition_on_previous_text=condition_on_previous_text,
                                   initial_prompt=initial_prompt, encoder=encoder, decoder=decoder, model=model,
                                   intervals=intervals, beam_size=beam_size, reset_on_loop=reset_on_loop, vad=vad,
@@ -498,18 +488,17 @@ def create_app(settings: Settings | None = None, components: Components | None =
             if job.status == JobStatus.completed:
                 source.segments = job.transcript.segments
                 source.duration_seconds = job.transcript.duration_seconds
-                source.language = job.transcript.language
         if source.status in (JobStatus.completed, JobStatus.failed):
             store_of(request).save_source(source)
         return source
 
-    def propose_segments(request: Request, source: BenchmarkSource, language: str) -> None:
+    def propose_segments(request: Request, source: BenchmarkSource) -> None:
         """Transcribe a copy of the recording (jobs delete their upload) to propose intervals."""
         service = service_of(request)
         job_id = uuid.uuid4().hex
         shutil.copyfile(store_of(request).source_audio(source.id), service.upload_path(job_id))
         try:
-            submit_job(service, job_id, source.filename, source.size_bytes, language)
+            submit_job(service, job_id, source.filename, source.size_bytes)
         except HTTPException:
             service.upload_path(job_id).unlink(missing_ok=True)
             raise
@@ -526,9 +515,9 @@ def create_app(settings: Settings | None = None, components: Components | None =
         return list(VARIANTS.values())
 
     @app.post("/benchmark/sources", response_model=BenchmarkSource, status_code=202)
-    async def add_source(request: Request, file: UploadFile = file_param, language: str | None = language_param):
+    async def add_source(request: Request, file: UploadFile = file_param):
         """Upload a real recording. Whisper transcribes it to propose intervals to pick and correct."""
-        language = check_ready(service_of(request), language)
+        check_ready(service_of(request))
         store = store_of(request)
         source_id = uuid.uuid4().hex
         path = store.source_audio(source_id)
@@ -536,9 +525,9 @@ def create_app(settings: Settings | None = None, components: Components | None =
         with path.open("rb") as f:
             media_type = MEDIA_TYPES[detect_format(f.read(16))]
         source = BenchmarkSource(id=source_id, filename=file.filename or "recording", size_bytes=size,
-                                 media_type=media_type, language=None if language == "auto" else language)
+                                 media_type=media_type)
         try:
-            propose_segments(request, source, language)
+            propose_segments(request, source)
         except HTTPException:
             path.unlink(missing_ok=True)
             (store.sources_dir / f"{source_id}.json").unlink(missing_ok=True)
@@ -560,13 +549,13 @@ def create_app(settings: Settings | None = None, components: Components | None =
         return FileResponse(store_of(request).source_audio(source_id), media_type=source.media_type)
 
     @app.post("/benchmark/sources/{source_id}/transcribe", response_model=BenchmarkSource, status_code=202)
-    async def retranscribe_source(request: Request, source_id: str,
-                                  language: str | None = Query(None, pattern=LANGUAGE_PATTERN)):
-        """Propose intervals again, e.g. in another language."""
+    async def retranscribe_source(request: Request, source_id: str):
+        """Propose intervals again, e.g. after changing the service's decoding defaults or model."""
         source = refresh_source(request, found(store_of(request).get_source, source_id))
         if source.status in (JobStatus.queued, JobStatus.processing):
             raise HTTPException(409, "This recording is already being transcribed")
-        propose_segments(request, source, check_ready(service_of(request), language))
+        check_ready(service_of(request))
+        propose_segments(request, source)
         return source
 
     @app.delete("/benchmark/sources/{source_id}", status_code=204)
@@ -635,8 +624,9 @@ def create_app(settings: Settings | None = None, components: Components | None =
     async def create_benchmark(request: Request, body: BenchmarkCreate):
         """Queue a run: every clip, with each model and decoding variant. It shares the transcription queue."""
         run = BenchmarkRun(id=uuid.uuid4().hex, models=list(dict.fromkeys(body.models)),
-                           variants=list(dict.fromkeys(body.variants)), language=body.language,
-                           initial_prompt=(body.initial_prompt or "").strip() or None, clip_ids=body.clip_ids or [])
+                           variants=list(dict.fromkeys(body.variants)),
+                           initial_prompt=(body.initial_prompt or "").strip() or None, clip_ids=body.clip_ids or [],
+                           kv_cache=settings.kv_cache if body.kv_cache is None else body.kv_cache)
         try:
             return runner_of(request).create(run)
         except BenchmarkError as e:
@@ -700,7 +690,7 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          "hop_ms": features.HOP_LENGTH * 1000 / features.SAMPLE_RATE, "window": "periodic Hann",
                          "n_mels": n_mels, "frames": features.N_FRAMES, "shape": [n_mels, features.N_FRAMES],
                          "scale": "log10, floor at (max − 8), then (x + 4) / 4"},
-            "decoding": {"default_language": settings.default_language, "max_new_tokens": settings.max_new_tokens,
+            "decoding": {"language": "en", "max_new_tokens": settings.max_new_tokens,
                          "temperature_fallback": settings.temperature_fallback,
                          "temperatures": list(asr.FALLBACK_TEMPERATURES),
                          "compression_ratio_threshold": asr.COMPRESSION_RATIO_THRESHOLD,
@@ -721,12 +711,6 @@ def create_app(settings: Settings | None = None, components: Components | None =
                          "timestamp_precision_seconds": asr.TIME_PRECISION},
         }
 
-    @app.get("/languages")
-    async def languages(request: Request):
-        """Language codes the loaded model can transcribe."""
-        service = service_of(request)
-        return {"languages": service.languages, "default": settings.default_language}
-
     @app.get("/health", response_model=HealthResponse)
     async def health(request: Request):
         service = service_of(request)
@@ -734,7 +718,6 @@ def create_app(settings: Settings | None = None, components: Components | None =
             status="ok" if service.transcriber else "degraded",
             model=service.transcriber.name if service.transcriber else None,
             model_error=service.transcriber_error,
-            languages=service.languages,
             queue_depth=service.queue.qsize(),
             active_jobs=service.active,
         )

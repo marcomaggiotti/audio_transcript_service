@@ -9,7 +9,7 @@ from app.asr import DecodingOptions, ModelLoadError, OnnxWhisperTranscriber, Whi
 
 # Tiny vocabulary: 0-9 text, then specials, then timestamps (0.02 s each).
 WORDS = ["hello", "world", "onnx", "runtime", "bye", "x5", "x6", "x7", "x8", "x9"]
-EOT, SOT, EN, DE, TRANSCRIBE, NO_TS = 10, 11, 12, 13, 14, 15
+EOT, SOT, NO_TS = 10, 11, 15
 PREV = 9  # stands in for <|startofprev|>; the scripted decoder only needs SOT to find the prompt
 TS = 16
 VOCAB = TS + 1501
@@ -43,13 +43,13 @@ class FakeEncoder:
 class ScriptedDecoder:
     """Returns logits that prefer the next token of a per-window script."""
 
-    def __init__(self, scripts, prompt_len=3, language_scores=None, strength=10.0):
+    def __init__(self, scripts, sot_scores=None, strength=10.0):
         self.scripts = scripts
-        self.prompt_len = prompt_len
-        self.language_scores = language_scores or {}
+        self.sot_scores = sot_scores or {}  # logits of the step right after <|startoftranscript|> (no-speech odds)
         self.strength = strength  # logit of the scripted token against zeros (lower = less sure)
         self.prompts: list[list[int]] = []  # every decoding attempt's prompt
         self.attempts: dict[int, int] = {}
+        self.windows_seen: set[int] = set()
 
     def get_inputs(self):
         return [SimpleNamespace(name="input_ids"), SimpleNamespace(name="encoder_hidden_states")]
@@ -58,11 +58,14 @@ class ScriptedDecoder:
         ids = feeds["input_ids"][0].tolist()
         window = int(feeds["encoder_hidden_states"][0, 0, 0]) - 1
         logits = np.zeros(VOCAB, dtype=np.float32)
-        if ids == [SOT]:  # language detection
-            for token, score in self.language_scores.items():
+        # The English-only prompt is just <|startoftranscript|>, the same tokens as the no-speech step, which is the
+        # first decoder call of every window.
+        if ids == [SOT] and window not in self.windows_seen:
+            self.windows_seen.add(window)
+            for token, score in self.sot_scores.items():
                 logits[token] = score
         else:
-            prompt = ids[: ids.index(SOT) + self.prompt_len]  # previous-text prompt included
+            prompt = ids[: ids.index(SOT) + 1]  # previous-text prompt included
             step = len(ids) - len(prompt)
             if step == 0:  # first step of a decoding attempt
                 self.prompts.append(prompt)
@@ -74,29 +77,25 @@ class ScriptedDecoder:
         return [logits[None, None, :]]
 
 
-def make(scripts, multilingual=True, **kw):
-    tokens = WhisperTokens(
-        eot=EOT, sot=SOT, transcribe=TRANSCRIBE, no_timestamps=NO_TS, timestamp_begin=TS,
-        lang_to_id={"en": EN, "de": DE} if multilingual else {}, suppress=[], prev=PREV,
-    )
-    decoder = ScriptedDecoder(scripts, prompt_len=3 if multilingual else 1, **kw)
+def make(scripts, **kw):
+    tokens = WhisperTokens(eot=EOT, sot=SOT, no_timestamps=NO_TS, timestamp_begin=TS, suppress=[], prev=PREV)
+    decoder = ScriptedDecoder(scripts, **kw)
     return OnnxWhisperTranscriber(FakeEncoder(), decoder, FakeTokenizer(), tokens)
 
 
 def test_segments_with_timestamps():
     script = [ts(0), 0, 1, ts(2.0), ts(2.0), 2, 3, ts(4.5), EOT]
-    result = make([script]).transcribe(np.zeros(16000 * 5, dtype=np.float32), language="en")
+    result = make([script]).transcribe(np.zeros(16000 * 5, dtype=np.float32))
     assert [(s.start, s.end, s.text) for s in result.segments] == [
         (0.0, 2.0, "hello world"), (2.0, 4.5, "onnx runtime"),
     ]
     assert result.text == "hello world onnx runtime"
-    assert result.language == "en"
 
 
 def test_long_audio_is_split_into_windows_with_offsets():
     first = [ts(0), 0, ts(29.0), EOT]  # single closing timestamp: whole window consumed
     second = [ts(1.0), 4, ts(3.0), EOT]
-    result = make([first, second]).transcribe(np.zeros(16000 * 40, dtype=np.float32), language="en")
+    result = make([first, second]).transcribe(np.zeros(16000 * 40, dtype=np.float32))
     assert [(s.start, s.end, s.text) for s in result.segments] == [(0.0, 29.0, "hello"), (31.0, 33.0, "bye")]
     # The trace: one closing timestamp consumes the whole window, so the second starts at 30 s with the last 10 s.
     assert [(w.start, w.length, w.consumed, w.segments, w.skipped) for w in result.windows] == [
@@ -105,36 +104,25 @@ def test_long_audio_is_split_into_windows_with_offsets():
 
 
 def test_end_times_are_clamped_to_audio_duration():
-    result = make([[ts(0), 0, ts(10.0), EOT]]).transcribe(np.zeros(16000 * 3, dtype=np.float32), "en")
+    result = make([[ts(0), 0, ts(10.0), EOT]]).transcribe(np.zeros(16000 * 3, dtype=np.float32))
     assert result.segments[0].end == 3.0
 
 
 def test_timestamp_rules_block_bad_output():
     # The script asks for text first and a timestamp going backwards; the rules must override both.
     script = [0, ts(0.5), 1, ts(0.2)]
-    result = make([script]).transcribe(np.zeros(16000 * 2, dtype=np.float32), "en")
+    result = make([script]).transcribe(np.zeros(16000 * 2, dtype=np.float32))
     seg = result.segments[0]
     assert seg.start == 0.0  # first token forced to a (near-zero) timestamp
     assert seg.end >= seg.start
 
 
-def test_language_detection():
-    t = make([[ts(0), 0, ts(1.0), EOT]], language_scores={EN: 1.0, DE: 5.0})
-    result = t.transcribe(np.zeros(16000 * 2, dtype=np.float32), language="auto")
-    assert result.language == "de"
-
-
-def test_english_only_model_uses_short_prompt():
-    t = make([[ts(0), 0, ts(1.0), EOT]], multilingual=False)
-    assert t._prompt("de") == [SOT]
+def test_prompt_is_start_of_transcript():
+    t = make([[ts(0), 0, ts(1.0), EOT]])
+    assert t._prompt() == [SOT]
+    assert t._prompt([0, 1]) == [PREV, 0, 1, SOT]  # after the previous text
     result = t.transcribe(np.zeros(16000, dtype=np.float32))
     assert result.segments[0].text == "hello"
-    assert result.language == "en"  # reported even though nothing was detected
-
-
-def test_unknown_language_rejected():
-    with pytest.raises(ValueError, match="Unsupported language"):
-        make([[EOT]])._prompt("xx")
 
 
 def test_missing_model_dir(tmp_path):
@@ -144,11 +132,12 @@ def test_missing_model_dir(tmp_path):
 
 def test_confidence_and_no_speech_are_recorded():
     NOSPEECH = 9  # any id works for the scripted decoder
-    t = make([[ts(0), 0, 1, ts(2.0), EOT]], language_scores={EN: 3.0, NOSPEECH: 2.0})
+    OTHER = 12  # some other token, more likely than no-speech
+    t = make([[ts(0), 0, 1, ts(2.0), EOT]], sot_scores={OTHER: 3.0, NOSPEECH: 2.0})
     t.tokens.no_speech = NOSPEECH
-    [seg] = t.transcribe(np.zeros(16000 * 3, dtype=np.float32), language="auto").segments
+    [seg] = t.transcribe(np.zeros(16000 * 3, dtype=np.float32)).segments
     sot = np.zeros(VOCAB)
-    sot[EN], sot[NOSPEECH] = 3.0, 2.0
+    sot[OTHER], sot[NOSPEECH] = 3.0, 2.0
     assert seg.no_speech_prob == pytest.approx(np.exp(2.0) / np.exp(sot).sum(), abs=1e-4)
     # Each text token had logit 10 against ~1500 zeros (fewer after the timestamp rules).
     assert -0.2 < seg.avg_logprob < 0
@@ -158,13 +147,13 @@ def test_progress_after_each_window():
     first = [ts(0), 0, ts(29.0), EOT]  # a single closing timestamp: the whole 30 s window is consumed
     second = [ts(1.0), 4, ts(3.0), EOT]
     seen = []
-    make([first, second]).transcribe(np.zeros(16000 * 40, dtype=np.float32), "en", on_progress=seen.append)
+    make([first, second]).transcribe(np.zeros(16000 * 40, dtype=np.float32), on_progress=seen.append)
     assert seen[0] == pytest.approx(30 / 40) and seen[-1] == 1.0
 
 
 def test_greedy_by_default_decodes_each_window_once():
     t = make([[ts(0), 0, ts(1.0), EOT]])
-    t.transcribe(np.zeros(16000 * 2, dtype=np.float32), "en")
+    t.transcribe(np.zeros(16000 * 2, dtype=np.float32))
     assert t.decoder.attempts == {0: 0}
 
 
@@ -173,11 +162,11 @@ def test_temperature_fallback_redecodes_a_repetition_loop():
     good = [ts(0), 2, 3, ts(5.0), EOT]
     audio = np.zeros(16000 * 6, dtype=np.float32)
 
-    greedy = make([[loop, good]]).transcribe(audio, "en")
+    greedy = make([[loop, good]]).transcribe(audio)
     assert greedy.segments[0].text.startswith("hello hello")
 
     t = make([[loop, good]])
-    fixed = t.transcribe(audio, "en", options=DecodingOptions(temperature_fallback=True))
+    fixed = t.transcribe(audio, options=DecodingOptions(temperature_fallback=True))
     assert [s.text for s in fixed.segments] == ["onnx runtime"]
     assert t.decoder.attempts == {0: 1}  # second attempt (temperature 0.2) was good enough
     [window] = fixed.windows
@@ -189,35 +178,35 @@ def test_fallback_skips_silent_unsure_windows():
     audio = np.zeros(16000 * 3, dtype=np.float32)
     options = DecodingOptions(temperature_fallback=True)
     # Weak logits make every token unsure (avg log-prob well below -1); no-speech dominates the first step.
-    t = make([[ts(0), 0, ts(1.0), EOT]], language_scores={NOSPEECH: 10.0}, strength=4.0)
+    t = make([[ts(0), 0, ts(1.0), EOT]], sot_scores={NOSPEECH: 10.0}, strength=4.0)
     t.tokens.no_speech = NOSPEECH
-    silent = t.transcribe(audio, "en", options=options)
+    silent = t.transcribe(audio, options=options)
     assert silent.segments == []
     assert t.decoder.attempts == {0: 0}  # silence: no retries
     assert silent.windows[0].skipped and silent.windows[0].no_speech_prob > 0.6 and silent.windows[0].segments == 0
-    t = make([[ts(0), 0, ts(1.0), EOT]], language_scores={NOSPEECH: 10.0}, strength=4.0)
+    t = make([[ts(0), 0, ts(1.0), EOT]], sot_scores={NOSPEECH: 10.0}, strength=4.0)
     t.tokens.no_speech = NOSPEECH
-    assert [s.text for s in t.transcribe(audio, "en").segments] == ["hello"]  # greedy keeps it
+    assert [s.text for s in t.transcribe(audio).segments] == ["hello"]  # greedy keeps it
 
 
 def test_previous_text_is_prompted_on_the_next_window():
     first = [ts(0), 0, 1, ts(29.0), EOT]
     second = [ts(0), 2, ts(3.0), EOT]
     t = make([first, second])
-    t.transcribe(np.zeros(16000 * 40, dtype=np.float32), "en",
+    t.transcribe(np.zeros(16000 * 40, dtype=np.float32),
                  options=DecodingOptions(condition_on_previous_text=True))
-    assert t.decoder.prompts == [[SOT, EN, TRANSCRIBE], [PREV, 0, 1, SOT, EN, TRANSCRIBE]]
+    assert t.decoder.prompts == [[SOT], [PREV, 0, 1, SOT]]
 
     t = make([first, second])
-    t.transcribe(np.zeros(16000 * 40, dtype=np.float32), "en")
-    assert t.decoder.prompts == [[SOT, EN, TRANSCRIBE]] * 2
+    t.transcribe(np.zeros(16000 * 40, dtype=np.float32))
+    assert t.decoder.prompts == [[SOT]] * 2
 
 
 def test_initial_prompt_on_every_window():
     t = make([[ts(0), 2, ts(29.0), EOT], [ts(0), 4, ts(2.0), EOT]])
-    t.transcribe(np.zeros(16000 * 40, dtype=np.float32), "en",
+    t.transcribe(np.zeros(16000 * 40, dtype=np.float32),
                  options=DecodingOptions(initial_prompt="onnx runtime", condition_on_previous_text=True))
-    assert t.decoder.prompts == [[PREV, 2, 3, SOT, EN, TRANSCRIBE], [PREV, 2, 3, 2, SOT, EN, TRANSCRIBE]]
+    assert t.decoder.prompts == [[PREV, 2, 3, SOT], [PREV, 2, 3, 2, SOT]]
 
 
 def test_onnx_precision_reads_the_graph_ops(tmp_path):
@@ -248,16 +237,16 @@ def test_precision_swaps_parts_for_one_job_and_back(tmp_path):
         assert used == {"encoder": "fp32", "decoder": "int8"} and loaded == []
     with t.precision_for(None, "fp32") as used:
         assert used == {"encoder": "fp32", "decoder": "fp32"} and t.encoder is default_encoder
-        assert t.transcribe(np.zeros(16000 * 3, dtype=np.float32), "en").text == "onnx runtime"
+        assert t.transcribe(np.zeros(16000 * 3, dtype=np.float32)).text == "onnx runtime"
     assert loaded == ["d32.onnx", "d.onnx"]  # swapped in, then the default loaded back
-    assert t.transcribe(np.zeros(16000 * 3, dtype=np.float32), "en").text == "hello world"
+    assert t.transcribe(np.zeros(16000 * 3, dtype=np.float32)).text == "hello world"
     with pytest.raises(ValueError, match="encoder precision fp16 isn't available"):
         with t.precision_for("fp16", None):
             pass
 
 
-def test_english_only_config_wins_over_language_tokens():
-    class Tokenizer:  # an .en tokenizer still has the language tokens
+def test_only_english_only_models_load():
+    class Tokenizer:  # whisper-tiny.en's special tokens (an .en tokenizer still has language tokens)
         ids = {"<|endoftext|>": 50256, "<|startoftranscript|>": 50257, "<|en|>": 50258, "<|it|>": 50274,
                "<|transcribe|>": 50358, "<|startofprev|>": 50360, "<|nocaptions|>": 50361}
 
@@ -265,62 +254,86 @@ def test_english_only_config_wins_over_language_tokens():
             return self.ids.get(token)
 
     from app.asr import _resolve_tokens
-    english = _resolve_tokens(Tokenizer(), {"is_multilingual": False, "no_timestamps_token_id": 50362,
-                                            "lang_to_id": {"<|en|>": 50258}})
-    assert not english.multilingual and english.timestamp_begin == 50363 and english.no_speech == 50361
-    multilingual = _resolve_tokens(Tokenizer(), {"no_timestamps_token_id": 50362})
-    assert multilingual.lang_to_id == {"en": 50258, "it": 50274}
+    english = _resolve_tokens(Tokenizer(), {"is_multilingual": False, "no_timestamps_token_id": 50362})
+    assert (english.sot, english.timestamp_begin, english.no_speech, english.prev) == (50257, 50363, 50361, 50360)
+    # The English-only flag wins even if the config also lists language tokens.
+    assert _resolve_tokens(Tokenizer(), {"is_multilingual": False, "no_timestamps_token_id": 50362,
+                                         "lang_to_id": {"<|en|>": 50258}}).sot == 50257
+    for multilingual in ({"is_multilingual": True}, {"lang_to_id": {"<|en|>": 50259, "<|it|>": 50274}}):
+        with pytest.raises(ModelLoadError, match="multilingual"):
+            _resolve_tokens(Tokenizer(), {"no_timestamps_token_id": 50363, **multilingual})
 
 
 class MergedDecoder(ScriptedDecoder):
-    """optimum's merged decoder: use_cache_branch picks the cached branch, which reads past_key_values. Here the
-    "keys" carry the token ids fed so far, so the scripted logits see the whole sequence either way."""
+    """Stand-in for optimum's merged decoder: use_cache_branch picks the cached branch, and the "keys" it caches
+    are the token ids themselves, so a step sees past + new tokens exactly when the cache is carried right."""
 
-    def __init__(self, *args, **kw):
-        super().__init__(*args, **kw)
-        self.fed: list[int] = []  # tokens fed per decoder call
+    def __init__(self, scripts, **kw):
+        super().__init__(scripts, **kw)
+        self.calls: list[tuple[bool, int]] = []  # (cached branch, tokens fed) of every call
 
     def get_inputs(self):
-        return super().get_inputs() + [SimpleNamespace(name="use_cache_branch", shape=[1]),
-                                       SimpleNamespace(name="past_key_values.0.decoder.key", shape=[1, 1, "seq", 1])]
+        return [SimpleNamespace(name=n) for n in ("input_ids", "encoder_hidden_states", "use_cache_branch")] + [
+            SimpleNamespace(name=f"past_key_values.0.{part}.key", shape=["batch", 1, "seq", 1])
+            for part in ("decoder", "encoder")]
 
     def get_outputs(self):
-        return [SimpleNamespace(name="logits"), SimpleNamespace(name="present.0.decoder.key")]
+        return [SimpleNamespace(name=n) for n in ("logits", "present.0.decoder.key", "present.0.encoder.key")]
 
     def run(self, outputs, feeds):
-        new = feeds["input_ids"][0].tolist()
-        self.fed.append(len(new))
         cached = bool(feeds["use_cache_branch"][0])
-        ids = (feeds["past_key_values.0.decoder.key"][0, 0, :, 0].astype(int).tolist() if cached else []) + new
-        [logits] = super().run(["logits"], {"input_ids": np.array([ids]),
-                                            "encoder_hidden_states": feeds["encoder_hidden_states"]})
-        return [logits, np.array(ids, dtype=np.float32).reshape(1, 1, -1, 1)]
+        new = feeds["input_ids"][0].tolist()
+        past = feeds["past_key_values.0.decoder.key"].reshape(-1).astype(int).tolist() if cached else []
+        self.calls.append((cached, len(new)))
+        ids = past + new
+        [logits] = super().run(None, {"input_ids": np.array([ids]), "encoder_hidden_states": feeds["encoder_hidden_states"]})
+        produced = {"logits": logits, "present.0.decoder.key": np.array(ids, np.float32).reshape(1, 1, -1, 1),
+                    "present.0.encoder.key": np.zeros((1, 1, 1500, 1), np.float32)}
+        return [produced[name] for name in (outputs or [o.name for o in self.get_outputs()])]
 
 
-def make_merged(scripts):
-    tokens = WhisperTokens(eot=EOT, sot=SOT, transcribe=TRANSCRIBE, no_timestamps=NO_TS, timestamp_begin=TS,
-                           lang_to_id={"en": EN, "de": DE}, suppress=[], prev=PREV)
-    return OnnxWhisperTranscriber(FakeEncoder(), MergedDecoder(scripts), FakeTokenizer(), tokens)
+def make_merged(scripts, **kw):
+    """A transcriber on the merged-decoder stand-in, so it has a KV cache to use or not."""
+    return OnnxWhisperTranscriber(FakeEncoder(), MergedDecoder(scripts, **kw), FakeTokenizer(), make([]).tokens)
 
 
 @pytest.mark.parametrize("beam_size", [1, 3])
-def test_the_kv_cache_feeds_one_token_per_step_and_off_the_whole_prefix(beam_size):
-    script = [ts(0), 0, 1, ts(2.0), EOT]
-    audio = np.zeros(16000 * 3, dtype=np.float32)
-    runs = {}
+def test_kv_cache_changes_the_work_not_the_transcript(beam_size):
+    scripts = [[ts(0), 0, 1, ts(2.0), ts(2.0), 2, 3, ts(29.0), EOT], [ts(1.0), 4, ts(3.0), EOT]]
+    audio = np.zeros(16000 * 40, dtype=np.float32)
+    results, calls = {}, {}
     for kv_cache in (True, False):
-        t = make_merged([script])
-        result = t.transcribe(audio, "en", options=DecodingOptions(kv_cache=kv_cache, beam_size=beam_size))
-        runs[kv_cache] = ([(s.start, s.end, s.text) for s in result.segments], t.decoder.fed)
-    assert t.kv_cache_available
-    assert runs[True][0] == runs[False][0] == [(0.0, 2.0, "hello world")]  # the same text either way
-    on, off = runs[True][1], runs[False][1]
-    assert on[0] == off[0] == 1  # <|startoftranscript|>: language and no-speech
-    assert on[1] == 3 and set(on[2:]) == {1}  # the prompt once, then only the new token
-    if beam_size == 1:
-        assert off[1:] == [3, 4, 5, 6, 7]  # every step re-feeds the whole prefix
-    assert sum(off) > sum(on)
+        decoder = MergedDecoder(scripts)
+        t = OnnxWhisperTranscriber(FakeEncoder(), decoder, FakeTokenizer(), make([]).tokens)
+        assert t.kv_cache_available
+        result = t.transcribe(audio, options=DecodingOptions(kv_cache=kv_cache, beam_size=beam_size,
+                                                                   condition_on_previous_text=True))
+        results[kv_cache] = [(s.start, s.end, s.text, s.avg_logprob) for s in result.segments]
+        calls[kv_cache] = [c for c in decoder.calls if c != (False, 1)]  # minus the one-token no-speech steps
+    assert results[True] == results[False]
+    assert results[True][0][2] == "hello world" and results[True][-1][2] == "bye"
+    # Cached: after the prompt, one new token per call. Off: always the first-call branch, with the whole text.
+    assert all(n == 1 for cached, n in calls[True] if cached) and any(cached for cached, _ in calls[True])
+    assert not any(cached for cached, _ in calls[False]) and max(n for _, n in calls[False]) > 5
 
 
-def test_a_legacy_export_has_no_kv_cache():
-    assert not make([[EOT]]).kv_cache_available  # decoder_model.onnx: no past inputs
+def test_cancel_check_stops_decoding_between_steps():
+    from app.asr import Cancelled, cancel_check
+
+    t = make([[ts(0)] + [0] * 100 + [ts(5.0), EOT]])
+    steps = []
+
+    def check():
+        steps.append(1)
+        if len(steps) > 5:
+            raise Cancelled("stop")
+
+    token = cancel_check.set(check)
+    try:
+        with pytest.raises(Cancelled):
+            t.transcribe(np.zeros(16000 * 6, dtype=np.float32))
+    finally:
+        cancel_check.reset(token)
+    assert len(steps) == 6  # checked before each decoder step, stopped at the first one after cancelling
+    fresh = make([[ts(0)] + [0] * 100 + [ts(5.0), EOT]])
+    assert fresh.transcribe(np.zeros(16000 * 6, dtype=np.float32)).segments  # no check set: runs to the end

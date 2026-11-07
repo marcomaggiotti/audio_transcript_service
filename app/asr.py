@@ -8,8 +8,11 @@ Expects the directory layout produced by scripts/export_whisper_onnx.py (optimum
       or decoder_model.onnx     input_ids + encoder_hidden_states -> logits (legacy, no KV cache:
                                 every step re-runs the whole prefix and returns [1, n, vocab] logits)
     tokenizer.json
-    generation_config.json    (optional, provides suppress/lang token ids)
+    generation_config.json    (optional, provides the suppressed token ids)
     preprocessor_config.json  (optional, provides n_mels)
+
+English only: the service runs English-only Whisper models (openai/whisper-*.en, by default whisper-tiny.en),
+whose prompt is just <|startoftranscript|>. A multilingual export is refused when it loads.
 
 Decoding is greedy with Whisper's timestamp rules, so every transcript comes back as
 segments with start/end times. Long audio is processed in 30 s windows that advance
@@ -25,6 +28,7 @@ import time
 import zlib
 from collections.abc import Callable
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Protocol
@@ -40,6 +44,22 @@ from app.features import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+
+class Cancelled(RuntimeError):
+    """Raised inside a transcription whose job was cancelled (DELETE /jobs/{id})."""
+
+
+# Set by the job worker around a transcription, in its own thread: called before every decoder step, it raises
+# Cancelled once the job is cancelled, so a stopped job frees the CPU within a step instead of running to the end.
+cancel_check: ContextVar[Callable[[], None] | None] = ContextVar("cancel_check", default=None)
+
+
+def check_cancelled() -> None:
+    if (check := cancel_check.get()) is not None:
+        check()
+
 
 TIME_PRECISION = 0.02  # seconds per timestamp token
 MAX_INITIAL_TIMESTAMP = 1.0  # first segment must start within 1 s of the window
@@ -65,13 +85,16 @@ class DecodingOptions:
     seed: int = 0  # for the sampled (temperature > 0) attempts, so runs are repeatable
     beam_size: int = 1  # 1 = greedy; more keeps that many candidate texts at temperature 0 (openai/whisper: 5)
     reset_on_loop: bool = True  # don't prompt the next window with a window whose text repeats itself
+    # Keep the decoder's keys/values of the tokens already written, so each step computes only the new one.
+    # Off: every step recomputes them from the whole text so far, and the cross-attention keys/values of all
+    # 1500 encoder frames too: the same tokens, about 10x the decoder work (times the beams with beam search).
+    # It is a speed-up only: the tokens Whisper conditions on are the same either way. Exports without a merged
+    # decoder (decoder_model.onnx only) never have it.
+    kv_cache: bool = True
     # Voice activity detection (app/vad.py): Whisper hears only the speech, cut at pauses into pieces up to 30 s.
     vad: bool = False
     vad_threshold: float = 0.5  # speech probability above which a 32 ms frame is speech
     vad_min_silence_ms: int = 500  # a pause at least this long ends a stretch of speech
-    # The decoder's KV cache: keep each step's self-attention keys and values and feed only the new token. Off, every
-    # step re-runs the whole prefix (same text, slower: for comparison). Exports without a merged decoder never have it.
-    kv_cache: bool = True
 
 
 @dataclass
@@ -101,7 +124,6 @@ class WindowTrace:
 
 @dataclass
 class TranscriptionResult:
-    language: str | None
     segments: list[Segment] = field(default_factory=list)
     windows: list[WindowTrace] = field(default_factory=list)
     speech: list[tuple[float, float]] | None = None  # with VAD: the stretches of speech Whisper heard
@@ -124,8 +146,7 @@ class WindowResult:
 class Transcriber(Protocol):
     name: str
 
-    def transcribe(self, audio: np.ndarray, language: str | None = None,
-                   on_progress: Callable[[float], None] | None = None,
+    def transcribe(self, audio: np.ndarray, on_progress: Callable[[float], None] | None = None,
                    options: DecodingOptions | None = None) -> TranscriptionResult: ...
 
 
@@ -134,23 +155,21 @@ MAX_BEAM_SIZE = 8
 
 
 def transcribe_intervals(transcriber: Transcriber, audio: np.ndarray, intervals: list[tuple[float, float]],
-                         language: str | None = None, on_progress: Callable[[float], None] | None = None,
+                         on_progress: Callable[[float], None] | None = None,
                          options: DecodingOptions | None = None) -> TranscriptionResult:
     """Transcribe each [start, end) of the audio on its own and return exactly one segment per interval, with the
     interval's own times (its text empty when Whisper heard nothing). Nothing is carried from one interval to the
     next (no previous-text prompt), so text can't leak across them: for transcribing a copy of a recording on the
-    original's lines. The first interval's detected language is used for the rest."""
+    original's lines."""
     options = replace(options or DecodingOptions(), condition_on_previous_text=False)
     duration = audio.shape[0] / SAMPLE_RATE
     segments: list[Segment] = []
     windows: list[WindowTrace] = []
-    detected = None if language in (None, "", "auto") else language
     for k, (start, end) in enumerate(intervals):
         start, end = max(0.0, float(start)), min(float(end), duration)
         piece = audio[int(start * SAMPLE_RATE) : int(end * SAMPLE_RATE)]
         if end - start >= 0.1 and piece.shape[0]:
-            result = transcriber.transcribe(piece, language=detected, options=options)
-            detected = detected or result.language
+            result = transcriber.transcribe(piece, options=options)
             texts = [s.text.strip() for s in result.segments if s.text.strip()]
             logprobs = [s.avg_logprob for s in result.segments if s.avg_logprob is not None]
             no_speech = [s.no_speech_prob for s in result.segments if s.no_speech_prob is not None]
@@ -163,38 +182,24 @@ def transcribe_intervals(transcriber: Transcriber, audio: np.ndarray, intervals:
             segments.append(Segment(round(min(start, duration), 2), round(max(end, min(start, duration)), 2), ""))
         if on_progress:
             on_progress((k + 1) / len(intervals))
-    return TranscriptionResult(language=detected, segments=segments, windows=windows)
+    return TranscriptionResult(segments=segments, windows=windows)
 
 
 class _PrefixSession:
-    """Decoder without a KV cache: every step re-runs the whole prefix (legacy exports)."""
+    """Decoder without a KV cache: every step re-runs the whole prefix. Used for legacy exports
+    (decoder_model.onnx), and for the merged decoder when kv_cache is off: `feeds` then select its first-call
+    branch (use_cache_branch false, empty past), which takes any number of tokens."""
 
-    def __init__(self, decoder, encoded: np.ndarray):
-        self.decoder, self.encoded = decoder, encoded
+    def __init__(self, decoder, encoded: np.ndarray, feeds: dict | None = None):
+        self.decoder, self.encoded, self.feeds = decoder, encoded, feeds or {}
 
     def __call__(self, tokens: list[int]) -> np.ndarray:
+        check_cancelled()
         logits = self.decoder.run(["logits"], {"input_ids": np.array([tokens], dtype=np.int64),
-                                               "encoder_hidden_states": self.encoded})[0]
+                                               "encoder_hidden_states": self.encoded, **self.feeds})[0]
         return logits[0, -1].astype(np.float32)
 
     def fork(self) -> "_PrefixSession":
-        return self
-
-
-class _UncachedSession:
-    """Merged decoder with its KV cache off: every step takes the first-call branch with the whole prefix and no past,
-    so nothing is kept between steps (what _CachedSession saves, measured)."""
-
-    def __init__(self, decoder, outputs: list[str], encoded: np.ndarray, empty_past: dict):
-        self.decoder, self.outputs, self.encoded, self.empty_past = decoder, outputs, encoded, empty_past
-
-    def __call__(self, tokens: list[int]) -> np.ndarray:
-        outputs = self.decoder.run(None, {"input_ids": np.array([tokens], dtype=np.int64),
-                                          "encoder_hidden_states": self.encoded,
-                                          "use_cache_branch": np.array([False]), **self.empty_past})
-        return outputs[self.outputs.index("logits")][0, -1].astype(np.float32)
-
-    def fork(self) -> "_UncachedSession":
         return self
 
 
@@ -208,6 +213,7 @@ class _CachedSession:
         self.decoder, self.outputs, self.encoded, self.past, self.fed = decoder, outputs, encoded, past, fed
 
     def __call__(self, tokens: list[int]) -> np.ndarray:
+        check_cancelled()
         first = self.fed == 0
         outputs = self.decoder.run(None, {
             "input_ids": np.array([tokens[self.fed:]], dtype=np.int64),
@@ -282,21 +288,20 @@ class WhisperTokens:
 
     eot: int
     sot: int
-    transcribe: int | None
     no_timestamps: int
     timestamp_begin: int
-    lang_to_id: dict[str, int]
     suppress: list[int]
-    no_speech: int | None = None  # <|nospeech|> (<|nocaptions|> in older checkpoints)
+    no_speech: int | None = None  # <|nocaptions|> in whisper-*.en (<|nospeech|> in newer checkpoints)
     prev: int | None = None  # <|startofprev|>: starts the previous-text prompt
-
-    @property
-    def multilingual(self) -> bool:
-        return bool(self.lang_to_id)
 
 
 def _load_json(path: Path) -> dict:
     return json.loads(path.read_text()) if path.exists() else {}
+
+
+def is_multilingual_config(generation_config: dict) -> bool:
+    """whisper-*.en say is_multilingual: false; a multilingual config says true, or lists its languages."""
+    return bool(generation_config.get("is_multilingual", bool(generation_config.get("lang_to_id"))))
 
 
 def _resolve_tokens(tokenizer, generation_config: dict) -> WhisperTokens:
@@ -307,24 +312,15 @@ def _resolve_tokens(tokenizer, generation_config: dict) -> WhisperTokens:
     no_ts = generation_config.get("no_timestamps_token_id") or tid("<|notimestamps|>")
     if eot is None or sot is None or no_ts is None:
         raise ModelLoadError("tokenizer.json is missing Whisper special tokens")
-
-    lang_to_id = {
-        tok.strip("<|>"): idx for tok, idx in (generation_config.get("lang_to_id") or {}).items()
-    }
-    if generation_config.get("is_multilingual") is False:
-        lang_to_id = {}  # English-only (whisper-*.en): its prompt has no language or task token
-    elif not lang_to_id:
-        for code in ("en", "de", "fr", "it", "es", "pt", "nl", "ja", "zh", "ru"):
-            if (idx := tid(f"<|{code}|>")) is not None:
-                lang_to_id[code] = idx
+    if is_multilingual_config(generation_config):
+        raise ModelLoadError("This is a multilingual Whisper model; the service runs English-only ones: export "
+                             "openai/whisper-tiny.en (or another openai/whisper-*.en)")
 
     return WhisperTokens(
         eot=eot,
         sot=sot,
-        transcribe=tid("<|transcribe|>"),
         no_timestamps=no_ts,
         timestamp_begin=no_ts + 1,
-        lang_to_id=lang_to_id,
         suppress=[t for t in generation_config.get("suppress_tokens", []) if t >= 0],
         no_speech=tid("<|nospeech|>") if tid("<|nospeech|>") is not None else tid("<|nocaptions|>"),
         prev=tid("<|startofprev|>"),
@@ -368,11 +364,6 @@ class OnnxWhisperTranscriber:
         # past_key_values.<i>.{decoder,encoder}.{key,value}: [batch, heads, seq, head_dim], seq = 0 at start
         self._empty_past = {name: (1, inp.shape[1], 0, inp.shape[3]) for name, inp in decoder_inputs.items()
                             if name.startswith("past_key_values.")}
-
-    @property
-    def supported_languages(self) -> list[str]:
-        """Language codes the model can transcribe (English-only models: just en)."""
-        return list(self.tokens.lang_to_id) if self.tokens.multilingual else ["en"]
 
     @classmethod
     def from_dir(cls, model_dir: str, max_new_tokens: int = 224, threads: int = 0,
@@ -520,8 +511,7 @@ class OnnxWhisperTranscriber:
 
     # ------------------------------------------------------------------ public
 
-    def transcribe(self, audio: np.ndarray, language: str | None = None,
-                   on_progress: Callable[[float], None] | None = None,
+    def transcribe(self, audio: np.ndarray, on_progress: Callable[[float], None] | None = None,
                    options: DecodingOptions | None = None) -> TranscriptionResult:
         """`on_progress` gets the share of the audio transcribed (0-1) after each 30 s window."""
         options = options or DecodingOptions()
@@ -531,7 +521,6 @@ class OnnxWhisperTranscriber:
         duration = audio.shape[0] / SAMPLE_RATE
         segments: list[Segment] = []
         windows: list[WindowTrace] = []
-        detected: str | None = None
         seek = 0  # in samples
 
         while seek < audio.shape[0]:
@@ -546,17 +535,10 @@ class OnnxWhisperTranscriber:
             mel = log_mel_spectrogram(pad_or_trim(window), self.n_mels)[:, :N_FRAMES]
             encoded = self.encoder.run(None, {self._encoder_input: mel[None]})[0]
 
-            # One decoder step after <|startoftranscript|> gives both the language and the no-speech odds.
-            sot_logits = self._next_logits([self.tokens.sot], encoded)
-            lang = language
-            if self.tokens.multilingual:
-                if lang in (None, "", "auto"):
-                    lang = detected or self._language_from(sot_logits)
-                detected = detected or lang
-            no_speech = self._no_speech_prob(sot_logits)
+            # One decoder step after <|startoftranscript|> gives the no-speech odds.
+            no_speech = self._no_speech_prob(self._next_logits([self.tokens.sot], encoded))
 
-            result = self._decode_with_fallback(encoded, lang, window_seconds, initial + previous,
-                                                no_speech, options, rng)
+            result = self._decode_with_fallback(encoded, window_seconds, initial + previous, no_speech, options, rng)
             silent = (options.temperature_fallback and no_speech is not None and no_speech > NO_SPEECH_THRESHOLD
                       and result.avg_logprob < LOGPROB_THRESHOLD)
             kept = len(segments)
@@ -587,21 +569,7 @@ class OnnxWhisperTranscriber:
             if on_progress:
                 on_progress(min(1.0, seek / audio.shape[0]))
 
-        # An English-only model (whisper-*.en) has nothing to detect: its transcripts are English.
-        return TranscriptionResult(language=(detected or language) if self.tokens.multilingual else "en",
-                                   segments=segments, windows=windows)
-
-    def detect_language(self, encoded: np.ndarray) -> str | None:
-        if not self.tokens.multilingual:
-            return None
-        return self._language_from(self._next_logits([self.tokens.sot], encoded))
-
-    def _language_from(self, logits: np.ndarray) -> str | None:
-        if not self.tokens.multilingual:
-            return None
-        codes = list(self.tokens.lang_to_id)
-        ids = np.array([self.tokens.lang_to_id[c] for c in codes])
-        return codes[int(np.argmax(logits[ids]))]
+        return TranscriptionResult(segments=segments, windows=windows)
 
     def _no_speech_prob(self, logits: np.ndarray) -> float | None:
         if self.tokens.no_speech is None:
@@ -617,18 +585,11 @@ class OnnxWhisperTranscriber:
         ids = self.tokenizer.encode(" " + text.strip(), add_special_tokens=False).ids
         return [t for t in ids if t < self.tokens.eot][-MAX_PROMPT_TOKENS:]
 
-    def _prompt(self, language: str | None, previous: list[int] | None = None) -> list[int]:
-        prompt = [self.tokens.sot]
-        if self.tokens.multilingual:
-            lang_id = self.tokens.lang_to_id.get(language or "en")
-            if lang_id is None:
-                raise ValueError(f"Unsupported language '{language}'")
-            prompt.append(lang_id)
-            if self.tokens.transcribe is not None:
-                prompt.append(self.tokens.transcribe)
+    def _prompt(self, previous: list[int] | None = None) -> list[int]:
+        """<|startoftranscript|>, after the previous text (<|startofprev|> ...) when there is some."""
         if previous and self.tokens.prev is not None:
-            prompt = [self.tokens.prev, *previous[-MAX_PROMPT_TOKENS:], *prompt]
-        return prompt
+            return [self.tokens.prev, *previous[-MAX_PROMPT_TOKENS:], self.tokens.sot]
+        return [self.tokens.sot]
 
     def _next_logits(self, tokens: list[int], encoded: np.ndarray) -> np.ndarray:
         return self._decoder_session(encoded)(tokens)
@@ -641,24 +602,24 @@ class OnnxWhisperTranscriber:
     def _decoder_session(self, encoded: np.ndarray, kv_cache: bool = True):
         """Return step(tokens) -> logits for the next token, for one window.
 
-        With the merged decoder and `kv_cache`, step() feeds only the tokens added since the previous call and keeps
+        With the merged decoder and kv_cache, step() feeds only the tokens added since the previous call and keeps
         the self-attention K/V in between; the cross-attention K/V (from encoded) are computed on the first call.
-        Without `kv_cache`, every step feeds the whole prefix and keeps nothing.
+        Without, every step runs the decoder over all the tokens so far.
         """
+        past = {name: np.zeros(shape, dtype=np.float32) for name, shape in self._empty_past.items()}
         if not self._kv_cache:
             return _PrefixSession(self.decoder, encoded)
-        past = {name: np.zeros(shape, dtype=np.float32) for name, shape in self._empty_past.items()}
         if not kv_cache:
-            return _UncachedSession(self.decoder, self._decoder_outputs, encoded, past)
+            return _PrefixSession(self.decoder, encoded, {"use_cache_branch": np.array([False]), **past})
         return _CachedSession(self.decoder, self._decoder_outputs, encoded, past, 0)
 
-    def _decode_with_fallback(self, encoded: np.ndarray, language: str | None, window_seconds: float,
+    def _decode_with_fallback(self, encoded: np.ndarray, window_seconds: float,
                               previous: list[int], no_speech: float | None, options: DecodingOptions,
                               rng: np.random.Generator) -> WindowResult:
         temperatures = FALLBACK_TEMPERATURES if options.temperature_fallback else (0.0,)
         tried: list[dict] = []
         for temperature in temperatures:
-            result = self._decode_window(encoded, language, window_seconds, previous, temperature, rng,
+            result = self._decode_window(encoded, window_seconds, previous, temperature, rng,
                                          beam_size=options.beam_size, kv_cache=options.kv_cache)
             tried.append({"temperature": temperature, "compression_ratio": round(result.compression_ratio, 3),
                           "avg_logprob": round(result.avg_logprob, 4),
@@ -670,12 +631,12 @@ class OnnxWhisperTranscriber:
                 break  # good enough, or silence (skipped by the caller, retrying won't help)
         return result
 
-    def _decode_window(self, encoded: np.ndarray, language: str | None, window_seconds: float,
+    def _decode_window(self, encoded: np.ndarray, window_seconds: float,
                        previous: list[int] | None = None, temperature: float = 0.0,
                        rng: np.random.Generator | None = None, beam_size: int = 1,
                        kv_cache: bool = True) -> WindowResult:
         """Decode one 30 s window: greedy (or beam search) at temperature 0, otherwise sampled."""
-        prompt = self._prompt(language, previous)
+        prompt = self._prompt(previous)
         steps = min(self.max_new_tokens, N_TEXT_CTX - len(prompt))
         if temperature == 0 and beam_size > 1:
             sampled, logprobs = self._beam_search(encoded, prompt, steps, beam_size, kv_cache)

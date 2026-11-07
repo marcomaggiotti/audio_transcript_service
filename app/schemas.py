@@ -72,7 +72,8 @@ class WindowTrace(BaseModel):
 
 
 class Transcript(BaseModel):
-    language: str | None
+    # Kept for clients that read it: the service runs English-only Whisper models (whisper-*.en).
+    language: str = Field("en", description="Always en")
     duration_seconds: float
     text: str
     segments: list[TranscriptSegment]
@@ -85,7 +86,6 @@ class Job(BaseModel):
     id: str
     filename: str
     size_bytes: int
-    language: str | None = Field(None, description="Requested language; None = auto-detect")
     status: JobStatus = JobStatus.queued
     stage: str | None = Field(None, description="While processing: decoding, then transcribing")
     progress: float = Field(0.0, ge=0, le=1, description="Share of the audio transcribed so far (0-1)")
@@ -93,6 +93,7 @@ class Job(BaseModel):
     temperature_fallback: bool = Field(False, description="Re-decode windows whose text repeats or is unsure")
     condition_on_previous_text: bool = Field(False, description="Prompt each window with the text before it")
     initial_prompt: str | None = Field(None, description="Vocabulary or style hint given to every window")
+    kv_cache: bool = Field(True, description="Decoder KV cache: faster, same tokens (ONNX engine only)")
     encoder_precision: str | None = Field(None, description="Requested encoder precision (fp32, int8, int4); None = default")
     decoder_precision: str | None = Field(None, description="Requested decoder precision (fp32, int8, int4); None = default")
     engine: str = Field("onnx", description="onnx (ONNX Runtime) or ctranslate2 (CTranslate2 through faster-whisper)")
@@ -103,10 +104,6 @@ class Job(BaseModel):
     vad: bool = Field(False, description="Transcribe only the speech voice activity detection finds")
     vad_threshold: float = Field(0.5, description="Speech probability above which a 32 ms frame is speech")
     vad_min_silence_ms: int = Field(500, description="A pause at least this long ends a stretch of speech")
-    kv_cache: bool = Field(True, description="Reuse the decoder's keys and values between steps (off: re-run the "
-                                             "whole prefix every step)")
-    graph_optimization: str | None = Field(None, description="ONNX Runtime graph optimization level the sessions are "
-                                                             "opened at: disabled, basic, extended, layout, all")
     intervals: list[tuple[float, float]] | None = Field(
         None, description="Transcribe only these [start, end] spans, each on its own: one segment per span")
     precision: dict[str, str] | None = Field(None, description="Precision actually used: {encoder, decoder}")
@@ -137,7 +134,7 @@ class HealthResponse(BaseModel):
     status: str
     model: str | None
     model_error: str | None = None
-    languages: list[str]
+    languages: list[str] = Field(["en"], description="Always [en]: English-only Whisper models")
     queue_depth: int
     active_jobs: int
 
@@ -152,7 +149,6 @@ class BenchmarkSource(BaseModel):
     filename: str
     size_bytes: int
     media_type: str
-    language: str | None = None
     created_at: datetime = Field(default_factory=utcnow)
     job_id: str | None = Field(None, description="Transcription job that proposes the intervals")
     status: JobStatus = JobStatus.queued
@@ -206,9 +202,9 @@ class BenchmarkVariant(BaseModel):
 class BenchmarkCreate(BaseModel):
     models: list[str] = Field(min_length=1, max_length=10)
     variants: list[str] = Field(min_length=1, max_length=10)
-    language: str = Field("auto", pattern=r"^([a-z]{2,3}|auto)$")
     initial_prompt: str | None = Field(None, max_length=1000)
     clip_ids: list[str] | None = Field(None, description="Clips to use; all when omitted")
+    kv_cache: bool | None = Field(None, description="Decoder KV cache (faster, same tokens); default KV_CACHE")
 
 
 class ClipResult(BaseModel):
@@ -252,9 +248,9 @@ class BenchmarkRun(BaseModel):
     status: JobStatus = JobStatus.queued
     models: list[str]
     variants: list[str]
-    language: str
     initial_prompt: str | None = None
     clip_ids: list[str]
+    kv_cache: bool = True
     created_at: datetime = Field(default_factory=utcnow)
     started_at: datetime | None = None
     finished_at: datetime | None = None

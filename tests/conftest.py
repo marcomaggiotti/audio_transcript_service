@@ -15,7 +15,6 @@ from app.main import Components, create_app
 
 class FakeTranscriber:
     name = "fake-whisper"
-    supported_languages = ["en", "de", "it"]
 
     def __init__(self, segments=None, error=None):
         self.segments = segments or [
@@ -25,13 +24,11 @@ class FakeTranscriber:
         ]
         self.error = error
         self.calls = 0
-        self.languages = []
         self.options = []  # DecodingOptions of each call
         self.gate: threading.Event | None = None  # set by a test to hold transcriptions until released
 
-    def transcribe(self, audio, language=None, on_progress=None, options=None):
+    def transcribe(self, audio, on_progress=None, options=None):
         self.calls += 1
-        self.languages.append(language)
         self.options.append(options)
         if on_progress:
             on_progress(0.5)  # as if half the windows were done
@@ -39,7 +36,7 @@ class FakeTranscriber:
             self.gate.wait(10)
         if self.error:
             raise self.error
-        return TranscriptionResult(language=language or "en", segments=list(self.segments))
+        return TranscriptionResult(segments=list(self.segments))
 
 
 def make_wav(seconds=1.0, rate=16000, channels=1, freq=440.0) -> bytes:
@@ -64,7 +61,6 @@ def settings(tmp_path):
         benchmark_dir=str(tmp_path / "benchmark"),
         models_dir=str(tmp_path / "models"),
         whisper_model_dir=str(tmp_path / "models" / "whisper-tiny"),
-        default_language="auto",
         max_upload_mb=1,
         max_audio_seconds=60,
         api_token=None,  # independent of an API_TOKEN exported in the developer's shell
