@@ -26,7 +26,7 @@ A multilingual export is refused when it loads, and left out of `MODELS_DIR`. Re
 
 | Area | Implementation |
 |---|---|
-| Speech recognition | Whisper exported to ONNX (fp32 encoder, INT8 KV-cache decoder: an INT8 encoder garbles real speech, see `scripts/export_whisper_onnx.py`). Whisper's timestamp rules, 30 s windows with seek, temperature fallback, previous-text and initial prompts (`app/asr.py`) |
+| Speech recognition | Whisper exported to ONNX (fp32 encoder, INT8 KV-cache decoder: an INT8 encoder garbles real speech, see `scripts/export_whisper_onnx.py`; every attention block fused into ONNX Runtime's MultiHeadAttention kernel). Whisper's timestamp rules, 30 s windows with seek, temperature fallback, previous-text and initial prompts (`app/asr.py`) |
 | Features | Whisper log-mel spectrogram in pure NumPy, no torch or librosa at runtime (`app/features.py`) |
 | Audio | Magic-byte format check, ffmpeg decoding to 16 kHz mono with a pure-Python WAV fallback (`app/audio.py`) |
 | Jobs | In-process asyncio queue with bounded concurrency. Synchronous requests use the same queue (`app/jobs.py`) |
@@ -130,10 +130,25 @@ options follow openai/whisper:
   Measured on a whisper-tiny-sized export (fp32, 30 s of speech, greedy, 2-CPU sandbox): disabled 8.1 s, basic 2.8 s,
   extended 2.5 s, layout 2.2 s, all 2.4 s, the same text at every level; opening took 0.5 s (disabled) to 1 s.
   Without optimization the decoder's many small steps are about 3x slower; above basic the gain is small, so keep
-  `all`. ONNX Runtime's transformer optimizer (`python -m onnxruntime.transformers.optimizer --model_type bart
-  --num_heads 6 --hidden_size 384`) fused GELU and LayerNorm on that encoder but ran no faster than `all` (127 vs
-  129 ms per window), and saving the optimized graph (`SessionOptions.optimized_model_filepath`) would only save the
-  ~1 s of opening, so the export doesn't do either; re-measure on a bigger model before adding them.
+  `all`. Saving the optimized graph (`SessionOptions.optimized_model_filepath`) would only save the ~1 s of opening,
+  so the export doesn't.
+- **Fused attention** (at export, in every model): the transformer-specific optimization the levels above don't
+  do. Every attention block runs in ONNX Runtime's `MultiHeadAttention` kernel instead of the exported chain of
+  reshapes, transposes, MatMuls, mask and Softmax: the encoder's self-attention, and in every decoder layer the
+  self-attention on the KV cache (the causal mask passed as the kernel's `attention_bias`, unchanged) and the
+  cross-attention on the encoder's keys (`scripts/export_whisper_onnx.py`, `fuse_attention`; whisper-tiny: 20
+  blocks). Where it's supported: a block that isn't in the expected pattern is left as it is, and the export runs
+  each fused graph against the exported one on sample inputs and keeps it only if the outputs match (within 1e-3;
+  measured within 3e-6), else keeps the exported graph and says why. Measured on whisper-tiny (2-CPU sandbox): a
+  cached decoder step 1.86 → 1.69 ms with the INT8 decoder (−9%), 2.82 → 2.69 ms fp32 (−4%), identical
+  transcripts, and the INT8 and INT4 copies quantize as before; the encoder's (fused since the first exports) saves
+  ~40 MB of peak memory per window, no [heads, 1500, 1500] score tensor. It's part of the graph, so it holds at
+  every `graph_optimization` level, `disabled` included; `GET /config` says which parts have it
+  (`engines.onnx.fused_attention`, and per model in `models`); `--no-fuse-attention` exports without it, to
+  measure. ONNX Runtime's own transformer optimizer (`onnxruntime.transformers.optimizer --model_type bart`) finds
+  no attention to fuse in optimum's export: it fuses only LayerNorm, GELU and their bias Adds, which the
+  `extended`/`all` levels already do when a model is opened (measured: no faster than `all`, 127 vs 129 ms per
+  encoder window).
 - **Voice activity detection** (`VAD`, `vad`, off by default; `vad_threshold`, `vad_min_silence_ms`): Silero VAD
   (MIT licence, a 2 MB ONNX model at `VAD_MODEL_PATH`, put in the image by the Dockerfile) gives each 32 ms of audio
   a speech probability. Stretches of speech (padded by 200 ms, ended by a pause of at least `vad_min_silence_ms`,
