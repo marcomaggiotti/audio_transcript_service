@@ -114,6 +114,7 @@ def test_a_run_trains_and_its_model_joins_the_others(trainer):
     clips = add_clips(trainer, 3)
     info = trainer.get("/training").json()
     assert info["available"] and info["device"] == "cpu" and info["clips"] == 3 and info["clip_seconds"] == 6.0
+    assert [c["id"] for c in info["clip_list"]] == clips and info["clip_list"][0]["reference"] == "Clip number 0 about Aipollo."
     res = trainer.post("/training/runs", json={"name": "Aipollo words!", "args": {"max_steps": 30, "eval_steps": 10},
                                                "data": {"test_size": 0.34, "seed": 7}})
     assert res.status_code == 202, res.text

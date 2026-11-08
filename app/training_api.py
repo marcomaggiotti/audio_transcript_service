@@ -81,6 +81,8 @@ async def overview(request: Request, refresh: bool = False):
             "base_models": [{"id": m.id, "default": m.default, "finetuned": m.id.startswith("finetuned/")}
                             for m in manager.models.list()],
             "clips": len(clips), "clip_seconds": round(sum(c.duration_seconds for c in clips), 1),
+            "clip_list": [{"id": c.id, "name": c.name, "duration_seconds": c.duration_seconds, "reference": c.reference}
+                          for c in clips],  # to try the parts on
             "running": manager.current, "defaults": TrainingRequest().model_dump()}
 
 
