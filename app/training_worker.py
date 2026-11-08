@@ -441,12 +441,29 @@ def _train(run_dir: Path, request: dict, status: Status, work: Path) -> int:
     subprocess.run([sys.executable, export["script"], "--model", str(saved), "--output", str(tmp), "--prune",
                     "--no-variants"], check=True, env=env)
     (tmp / "model_id.txt").write_text(export["model_id"] + "\n")
+    shared = share_encoder(Path(request["base"].get("dir") or ""), tmp) if args_in.get("freeze_encoder") else False
     shutil.move(str(saved), str(tmp / "torch"))  # the PyTorch weights: a base for training it further
     shutil.rmtree(out, ignore_errors=True)
     tmp.replace(out)
     status.update(phase="done", message="Trained and exported", model_id=export["model_id"], model_dir=str(out),
-                  export_seconds=round(time.monotonic() - t0, 1))
+                  export_seconds=round(time.monotonic() - t0, 1),
+                  encoder=f"the encoder of {request['base']['id']} (frozen): shared" if shared else "its own")
     return 0
+
+
+def share_encoder(base_dir: Path, export_dir: Path) -> bool:
+    """With the encoder frozen, its weights are the base model's: put the base export's encoder file in place of the
+    one just exported, so the two are byte for byte the same and the service runs one encoder session for both and
+    reuses their encoder outputs (app/encoder_cache.py). False when the base has no ONNX export to take it from."""
+    source = base_dir / "encoder_model.onnx"
+    if not source.is_file():
+        return False
+    for name in ("encoder_model.onnx", "encoder_model.onnx_data"):
+        if (base_dir / name).exists():
+            shutil.copyfile(base_dir / name, export_dir / name)
+        else:
+            (export_dir / name).unlink(missing_ok=True)
+    return True
 
 
 def main(argv: list[str]) -> int:

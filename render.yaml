@@ -55,6 +55,15 @@ services:
       # (512 MB) compare at most tiny models; use standard (2 GB) for base.en or small.en.
       - key: BENCHMARK_MODELS
         value: ""
+      # The encoder's output per 30 s window, kept and reused when the same encoder meets the same window again (a clip
+      # run again, the same lines, a fine-tuned model sharing its base's encoder): 64 MB of memory, and 200 MB of the
+      # disk so it survives deploys (whisper-tiny.en: 2.3 MB a window).
+      - key: ENCODER_CACHE_MB
+        value: "64"
+      - key: ENCODER_CACHE_DIR
+        value: /data/encoder-cache
+      - key: ENCODER_CACHE_DISK_MB
+        value: "200"
       # "true": fine-tuning on the benchmark set (the podcast app's Training tab): PyTorch and transformers in the
       # image (+1 GB) and the model's PyTorch weights. Training whisper-tiny.en needs about 2-3 GB of memory (pro,
       # 4 GB; not starter) and each fine-tuned model ~250 MB of the disk. On a CPU, keep runs to a few hundred steps.

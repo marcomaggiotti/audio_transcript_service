@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.asr import PRECISIONS, Transcriber, _release_memory, is_multilingual_config, onnx_precision
+from app.encoder_cache import file_digest
 
 logger = logging.getLogger(__name__)
 
@@ -37,16 +38,22 @@ class ModelInfo:
     precision: dict[str, str] = field(default_factory=dict)  # the export's default {encoder, decoder}
     available_precisions: dict[str, list[str]] = field(default_factory=dict)
     size_mb: float = 0.0  # the default encoder + decoder files
+    encoder_mb: float = 0.0  # the default encoder file
+    encoder_digest: str | None = None  # its content: models with the same one share the encoder session and outputs
+    shared_encoder: str | None = None  # the service's own model, when this one's encoder file is the same
 
     @property
     def needs_mb(self) -> float:
-        """Memory the model needs loaded and transcribing, beyond what the process already uses."""
-        return round(self.size_mb * WEIGHTS_FACTOR + RUNTIME_OVERHEAD_MB)
+        """Memory the model needs loaded and transcribing, beyond what the process already uses: without its encoder
+        when it shares the service's (always loaded, so already counted)."""
+        weights = self.size_mb - (self.encoder_mb if self.shared_encoder else 0)
+        return round(weights * WEIGHTS_FACTOR + RUNTIME_OVERHEAD_MB)
 
     def view(self, fits: bool | None, reason: str | None) -> dict:
         return {"id": self.id, "default": self.default, "precision": self.precision,
                 "available_precisions": self.available_precisions, "size_mb": round(self.size_mb),
-                "needs_mb": None if self.default else self.needs_mb, "fits": fits, "reason": reason}
+                "needs_mb": None if self.default else self.needs_mb, "fits": fits, "reason": reason,
+                "shared_encoder": self.shared_encoder}
 
 
 def describe_export(path: Path, default: bool = False) -> ModelInfo:
@@ -62,6 +69,9 @@ def describe_export(path: Path, default: bool = False) -> ModelInfo:
         except (OSError, ValueError):  # missing or empty (a placeholder): nothing to say about this part
             continue
         info.size_mb += main.stat().st_size / 1e6
+        if part == "encoder":
+            info.encoder_mb = main.stat().st_size / 1e6
+            info.encoder_digest = file_digest(main)
         stem = default_file.removesuffix(".onnx")
         info.available_precisions[part] = sorted({info.precision[part]} | {
             p for p in PRECISIONS if (path / f"{stem}.{p}.onnx").exists()})
@@ -133,6 +143,20 @@ class ModelSet:
                 continue
             info = describe_export(path)
             self._models.setdefault(info.id, info)  # the same model exported twice: the first wins
+        for info in self._models.values():
+            self._mark_shared(info)
+
+    def _default_digest(self) -> str | None:
+        default = next((m for m in self._models.values() if m.default), None)
+        if default is None:
+            return None
+        return getattr(self.default, "encoder_digest", None) or default.encoder_digest
+
+    def _mark_shared(self, info: ModelInfo) -> None:
+        """A model whose encoder file is the service model's (fine-tuned with its encoder frozen) shares its encoder."""
+        digest = self._default_digest()
+        if not info.default and digest and info.encoder_digest == digest:
+            info.shared_encoder = next(m.id for m in self._models.values() if m.default)
 
     def list(self) -> list[ModelInfo]:
         return list(self._models.values())
@@ -143,6 +167,7 @@ class ModelSet:
         if is_multilingual(path):
             raise ModelUnavailable(f"{path} is a multilingual model; the service runs English-only ones")
         info = describe_export(path)
+        self._mark_shared(info)
         self._models = {**self._models, info.id: info}
         return info
 

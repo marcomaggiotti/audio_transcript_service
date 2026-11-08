@@ -26,6 +26,14 @@ from app.vad import SileroVad, transcribe_with
 logger = logging.getLogger(__name__)
 
 
+def _cache_counts(windows) -> dict:
+    """How many of a job's windows were encoded, and how many of those came from the encoder cache (ONNX only)."""
+    if not windows:
+        return {}
+    return {"windows": len(windows),
+            "encoder_cache_hits": sum(1 for w in windows if getattr(w, "encoder_cached", False))}
+
+
 class QueueFullError(RuntimeError):
     pass
 
@@ -282,7 +290,8 @@ class TranscriptionService:
                       for i, s in enumerate(result.segments)],
             windows=[WindowTrace(start=w.start, length=w.length, consumed=w.consumed, no_speech_prob=w.no_speech_prob,
                                  skipped=w.skipped, segments=w.segments, attempts=w.attempts,
-                                 prompt_reset=getattr(w, "prompt_reset", False))
+                                 prompt_reset=getattr(w, "prompt_reset", False),
+                                 encoder_cached=getattr(w, "encoder_cached", False))
                      for w in getattr(result, "windows", None) or []],
             speech=getattr(result, "speech", None),
         )
@@ -294,6 +303,7 @@ class TranscriptionService:
             load_seconds=round(t_load - t1, 3) if t_load - t1 >= 0.01 else None,
             peak_memory_mb=peak_memory_mb(),
             engine=job.engine, model_mb=weights_mb, **(extra or {}),
+            **_cache_counts(getattr(result, "windows", None)),
         )
         # Status last, so a reader that sees "completed" also sees the transcript.
         job.progress, job.stage = 1.0, None

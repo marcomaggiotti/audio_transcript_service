@@ -106,7 +106,7 @@ def test_the_split_is_seeded_and_keeps_both_sides(clips):
 
 def run_request(tmp_path, base, clips, export=True, **args):
     run_dir = tmp_path / "run"
-    run_dir.mkdir()
+    run_dir.mkdir(parents=True)
     request = {"base": base, "clips": clips, "data": {"test_size": 0.4, "seed": 1}, "tokenizer": {}, "processor": {},
                "collator": {}, "metric": {"name": "wer"}, "threads": 1, "work_dir": str(tmp_path / "work"),
                "args": {"learning_rate": 1e-3, "per_device_train_batch_size": 2, "gradient_accumulation_steps": 1,
@@ -183,3 +183,58 @@ def test_the_api_drives_the_real_worker(settings, transcriber):
         assert run["status"] == "completed" and run["exported"] and run["data"]["test"] == 1, run
         assert run["model_id"] in {m["id"] for m in c.get("/config").json()["models"]}
         assert run["final"]["examples"] and run["history"]
+
+
+@pytest.fixture(scope="module")
+def onnx_base(tmp_path_factory, base):
+    """The base model as the Docker image keeps it with TRAINING=true: its ONNX export, its PyTorch weights in torch/."""
+    folder = tmp_path_factory.mktemp("onnx-base") / "whisper-test.en"
+    subprocess.run([sys.executable, str(ROOT / "scripts" / "export_whisper_onnx.py"), "--model",
+                    str(Path(base["dir"]) / "torch"), "--output", str(folder), "--prune", "--no-variants"],
+                   check=True, capture_output=True, env={**__import__("os").environ,
+                                                        "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin"})
+    (folder / "model_id.txt").write_text("tiny/whisper-test.en\n")
+    import shutil
+    shutil.copytree(Path(base["dir"]) / "torch", folder / "torch")
+    return {"id": "tiny/whisper-test.en", "dir": str(folder)}
+
+
+def test_the_encoder_cache_is_exact_and_the_session_shared(onnx_base):
+    from app.asr import OnnxWhisperTranscriber
+    from app.encoder_cache import EncoderCache
+
+    cache = EncoderCache(limit_mb=64)
+    first = OnnxWhisperTranscriber.from_dir(onnx_base["dir"], max_new_tokens=6, encoder_cache=cache)
+    second = OnnxWhisperTranscriber.from_dir(onnx_base["dir"], max_new_tokens=6, encoder_cache=cache)
+    assert second.encoder is first.encoder  # one encoder session for both
+    audio = np.random.default_rng(3).standard_normal(16000 * 3).astype(np.float32) * 0.05
+    a, b = first.transcribe(audio), second.transcribe(audio)
+    assert [w.encoder_cached for w in a.windows] == [False] and [w.encoder_cached for w in b.windows] == [True]
+    plain = OnnxWhisperTranscriber.from_dir(onnx_base["dir"], max_new_tokens=6)  # no cache
+    assert a.text == b.text == plain.transcribe(audio).text  # the same transcript with or without it
+
+
+def test_a_frozen_encoder_is_shared_with_the_base(tmp_path, onnx_base, clips):
+    from app.asr import OnnxWhisperTranscriber
+    from app.encoder_cache import EncoderCache
+
+    run_dir = run_request(tmp_path, onnx_base, clips, freeze_encoder=True)
+    assert worker.train(run_dir) == 0
+    status = json.loads((run_dir / "status.json").read_text())
+    assert status["phase"] == "done" and status["encoder"].startswith("the encoder of tiny/whisper-test.en (frozen)")
+    tuned = tmp_path / "models" / "tiny-test"
+    base_encoder = (Path(onnx_base["dir"]) / "encoder_model.onnx").read_bytes()
+    assert (tuned / "encoder_model.onnx").read_bytes() == base_encoder  # byte for byte
+    assert (tuned / "decoder_model_merged.onnx").read_bytes() != (Path(onnx_base["dir"]) / "decoder_model_merged.onnx").read_bytes()
+
+    cache = EncoderCache(limit_mb=64)
+    base_model = OnnxWhisperTranscriber.from_dir(onnx_base["dir"], max_new_tokens=6, encoder_cache=cache)
+    tuned_model = OnnxWhisperTranscriber.from_dir(str(tuned), max_new_tokens=6, encoder_cache=cache)
+    assert tuned_model.encoder is base_model.encoder and tuned_model.encoder_digest == base_model.encoder_digest
+    audio = np.random.default_rng(4).standard_normal(16000 * 2).astype(np.float32) * 0.05
+    base_model.transcribe(audio)
+    assert [w.encoder_cached for w in tuned_model.transcribe(audio).windows] == [True]  # the base's output, reused
+
+    unfrozen = run_request(tmp_path / "again", onnx_base, clips, freeze_encoder=False)
+    assert worker.train(unfrozen) == 0
+    assert json.loads((unfrozen / "status.json").read_text())["encoder"] == "its own"

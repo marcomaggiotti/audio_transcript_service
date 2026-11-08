@@ -58,6 +58,13 @@ class Settings(BaseModel):
     benchmark_dir: str = _env("BENCHMARK_DIR", "./data/benchmark")
     max_clip_seconds: int = int(_env("MAX_CLIP_SECONDS", "300"))
 
+    # Encoder outputs kept and reused (app/encoder_cache.py): the same 30 s window through the same encoder isn't
+    # encoded twice. In memory, at most ENCODER_CACHE_MB (0 = off; whisper-tiny.en: 2.3 MB a window). With
+    # ENCODER_CACHE_DIR, also on disk, at most ENCODER_CACHE_DISK_MB, kept across restarts.
+    encoder_cache_mb: float = float(_env("ENCODER_CACHE_MB", "64"))
+    encoder_cache_dir: str = _env("ENCODER_CACHE_DIR", "")
+    encoder_cache_disk_mb: float = float(_env("ENCODER_CACHE_DISK_MB", "256"))
+
     # Fine-tuning on the benchmark set (app/training.py): runs, their logs and the fine-tuned models (exported to ONNX,
     # chosen like the others). TRAINING_PYTHON needs PyTorch and transformers: the image builds /opt/train with
     # --build-arg TRAINING=true. Intermediate checkpoints go to TRAINING_WORK_DIR (default: the system's temp dir),

@@ -35,6 +35,8 @@ from typing import Protocol
 
 import numpy as np
 
+from app.encoder_cache import ENCODERS, EncoderCache, file_digest, mel_digest
+
 from app.features import (
     N_FRAMES,
     N_SAMPLES,
@@ -120,6 +122,7 @@ class WindowTrace:
     segments: int
     attempts: list[dict] = field(default_factory=list)  # each decode: temperature, compression_ratio, avg_logprob
     prompt_reset: bool = False  # its text looped, so the next window wasn't prompted with it
+    encoder_cached: bool = False  # the encoder's output came from the encoder cache (app/encoder_cache.py)
 
 
 @dataclass
@@ -346,6 +349,11 @@ class OnnxWhisperTranscriber:
         self._open_session: Callable[[Path, str], object] | None = None  # (file, graph optimization level)
         self.graph_optimization: str | None = None  # the level the loaded sessions were opened with
         self.session_seconds: float | None = None  # how long opening them took (optimizing the graph included)
+        # Encoder outputs kept and reused (shared by every model of the service), and the file and graph optimization
+        # level the encoder session in use was opened from: its key there. None: not cached (test stand-ins).
+        self.encoder_cache: EncoderCache | None = None
+        self._encoder_source: tuple[Path, str] | None = None
+        self._open_encoder: Callable[[Path, str], object] | None = None
         self._bind(encoder, decoder)
 
     def _bind(self, encoder, decoder) -> None:
@@ -367,7 +375,8 @@ class OnnxWhisperTranscriber:
 
     @classmethod
     def from_dir(cls, model_dir: str, max_new_tokens: int = 224, threads: int = 0,
-                 low_memory: bool = False, graph_optimization: str = "all") -> "OnnxWhisperTranscriber":
+                 low_memory: bool = False, graph_optimization: str = "all",
+                 encoder_cache: EncoderCache | None = None) -> "OnnxWhisperTranscriber":
         import onnxruntime as ort
         from tokenizers import Tokenizer
 
@@ -396,11 +405,17 @@ class OnnxWhisperTranscriber:
             options.graph_optimization_level = graph_level(level)  # read when the session is created
             return ort.InferenceSession(str(file), options, providers=providers)
 
+        def open_encoder(file: Path, level: str):
+            """The encoder's session: the one already open when a loaded model has this very encoder file (a fine-tuned
+            model and its base, the encoder frozen), else a new one."""
+            key = ("encoder", file_digest(file), level, threads, low_memory)
+            return ENCODERS.open(key, lambda: open_session(file, level))[0]
+
         if graph_optimization not in GRAPH_LEVELS:
             logger.warning("Unknown graph optimization level %r (%s): using all", graph_optimization, ", ".join(GRAPH_LEVELS))
             graph_optimization = "all"
         t0 = time.perf_counter()
-        encoder = open_session(path / "encoder_model.onnx", graph_optimization)
+        encoder = open_encoder(path / "encoder_model.onnx", graph_optimization)
         decoder = open_session(path / decoder_file, graph_optimization)
         opened = time.perf_counter() - t0
         tokenizer = Tokenizer.from_file(str(path / "tokenizer.json"))
@@ -421,6 +436,9 @@ class OnnxWhisperTranscriber:
                     files[p] = path / f"{stem}.{p}.onnx"
             transcriber.variants[part] = files
         transcriber._open_session = open_session
+        transcriber._open_encoder = open_encoder
+        transcriber._encoder_source = (path / "encoder_model.onnx", graph_optimization)
+        transcriber.encoder_cache = encoder_cache
         transcriber._load_session = lambda file: open_session(file, transcriber.graph_optimization or graph_optimization)
         transcriber.graph_optimization, transcriber.session_seconds = graph_optimization, round(opened, 3)
         return transcriber
@@ -484,7 +502,10 @@ class OnnxWhisperTranscriber:
             self.encoder = self.decoder = None  # release before reopening: never two copies in memory
             _release_memory()
             t0 = time.perf_counter()
-            encoder, decoder = self._open_session(files["encoder"], at), self._open_session(files["decoder"], at)
+            encoder = (self._open_encoder or self._open_session)(files["encoder"], at)
+            decoder = self._open_session(files["decoder"], at)
+            if self._encoder_source is not None:
+                self._encoder_source = (files["encoder"], at)
             self.graph_optimization = at
             self._bind(encoder, decoder)
             return round(time.perf_counter() - t0, 3)
@@ -505,8 +526,31 @@ class OnnxWhisperTranscriber:
             setattr(self, part, None)  # drop the last reference before loading the replacement
         _release_memory()
         for part, p in precisions.items():
-            sessions[part] = self._load_session(self.variants[part][p])
+            file = self.variants[part][p]
+            if part == "encoder" and self._open_encoder is not None:
+                level = self.graph_optimization or "all"
+                sessions[part] = self._open_encoder(file, level)
+                self._encoder_source = (file, level)
+            else:
+                sessions[part] = self._load_session(file)
         self._bind(sessions["encoder"], sessions["decoder"])
+
+    @property
+    def encoder_digest(self) -> str | None:
+        """A digest of the encoder file in use: the same for models that share their encoder."""
+        return file_digest(self._encoder_source[0]) if self._encoder_source else None
+
+    def _encode(self, mel: np.ndarray) -> tuple[np.ndarray, bool]:
+        """The encoder's output for one window, and whether it came from the encoder cache: a window this encoder
+        (the same file, at the same graph optimization level) already encoded isn't encoded again."""
+        cache, source = self.encoder_cache, self._encoder_source
+        if cache is None or source is None or not cache.enabled:
+            return self.encoder.run(None, {self._encoder_input: mel[None]})[0], False
+        key = f"{file_digest(source[0])}-{source[1]}-{mel_digest(mel)}"
+        found = cache.get(key)
+        if found is not None:
+            return found, True
+        return cache.put(key, self.encoder.run(None, {self._encoder_input: mel[None]})[0]), False
 
 
     # ------------------------------------------------------------------ public
@@ -533,7 +577,7 @@ class OnnxWhisperTranscriber:
             offset = seek / SAMPLE_RATE
 
             mel = log_mel_spectrogram(pad_or_trim(window), self.n_mels)[:, :N_FRAMES]
-            encoded = self.encoder.run(None, {self._encoder_input: mel[None]})[0]
+            encoded, cached = self._encode(mel)
 
             # One decoder step after <|startoftranscript|> gives the no-speech odds.
             no_speech = self._no_speech_prob(self._next_logits([self.tokens.sot], encoded))
@@ -564,7 +608,7 @@ class OnnxWhisperTranscriber:
             moved = max(int(result.consumed * SAMPLE_RATE), SAMPLE_RATE)  # always move forward
             windows.append(WindowTrace(round(offset, 2), round(window_seconds, 2), round(moved / SAMPLE_RATE, 2),
                                        None if no_speech is None else round(no_speech, 4), silent,
-                                       len(segments) - kept, result.attempts, reset))
+                                       len(segments) - kept, result.attempts, reset, cached))
             seek += moved
             if on_progress:
                 on_progress(min(1.0, seek / audio.shape[0]))

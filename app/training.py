@@ -132,7 +132,7 @@ class TrainingRequest(BaseModel):
 # ---------------------------------------------------------------- a run
 
 STATUS_KEYS = ("phase", "message", "step", "max_steps", "epoch", "history", "data", "baseline", "final", "best_step",
-               "stopped_at", "device", "threads", "versions", "train_seconds", "train_loss", "export_seconds")
+               "stopped_at", "device", "threads", "versions", "train_seconds", "train_loss", "export_seconds", "encoder")
 
 
 class TrainingRun(BaseModel):
@@ -168,6 +168,7 @@ class TrainingRun(BaseModel):
     train_seconds: float | None = None
     train_loss: float | None = None
     export_seconds: float | None = None
+    encoder: str | None = Field(None, description="Whether the exported model shares its base's encoder (frozen)")
 
 
 def slug(text: str) -> str:

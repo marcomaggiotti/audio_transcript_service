@@ -292,6 +292,41 @@ lists the models (`models`: precisions, `needs_mb`, `fits`, `reason`) and `memor
 | whisper-base.en | 74 M parameters | between the two (not measured yet) | standard (2 GB) |
 | whisper-small.en | 244 M parameters | ~1 GB, next to tiny.en | standard (2 GB) |
 
+## Encoder cache and shared encoders
+
+Whisper's encoder turns each 30 s window into the 1500 vectors the decoder reads at every step, and costs the same for
+every window whatever is said: on one CPU thread, a model with whisper-tiny.en's shapes (exported as here) takes 0.29 s
+per window, then 0.45–0.9 s to decode 50–150 tokens with the KV cache. The same window through the same encoder always
+gives the same vectors, so the service keeps them (`app/encoder_cache.py`), keyed by a digest of the encoder file (and
+the graph optimization level) and a digest of the window's log-mel spectrogram, and doesn't encode that window again:
+
+- a benchmark clip run again with other decoding options or by a model with the same encoder (below), an experiment,
+  the podcast app's Common words test (without, then with a prompt);
+- the same lines (`intervals`) or VAD pieces transcribed again;
+- windows of digital silence.
+
+A window read from the cache took 1.3–2.2× less time in that measurement (less with beam search, which decodes more),
+and the transcript is the same: the arrays are the encoder's own float32 output. A long recording transcribed again
+without VAD or intervals gains less: each window starts where the previous one's last complete segment ended, so after
+the first window the starts move with the decoding options.
+
+In memory: at most `ENCODER_CACHE_MB` (64 MB, about 28 windows of whisper-tiny.en at 2.3 MB each; 0 = off), the least
+recently used first out. With `ENCODER_CACHE_DIR`, windows are also written there (at most `ENCODER_CACHE_DISK_MB`, the
+least recently used deleted first) and found again after a restart or a deploy. Each job's metrics say how many of its
+windows came from the cache (`windows`, `encoder_cache_hits`; `encoder_cached` on each window of the transcript), and
+`GET /config` has the cache's size, hits and misses (`encoder_cache`). CTranslate2 jobs don't use it.
+
+**Shared encoders.** A model whose encoder file is, byte for byte, the one of a loaded model gets that encoder session
+instead of a second copy in memory, and the same cached windows. A model fine-tuned with `freeze_encoder` (the default,
+see Fine-tuning) is exported with its base's encoder file, so it shares the service model's encoder: `GET /config`
+marks it (`shared_encoder`) and the memory check counts only its decoder.
+
+**Why not keep the decoder's KV cache for all the audio?** Its keys and values depend on the window's audio (every
+decoder layer after the first attends to the encoder's output) and on the text written so far, so no two windows share
+them. Within a window the service already reuses them from step to step (`KV_CACHE`), and beam search's beams share the
+keys and values computed from the audio. Only the first layer's keys and values of a fixed prompt don't depend on the
+audio: too little to be worth keeping.
+
 ## Fine-tuning on the benchmark set
 
 The benchmark set's clips (lines of your recordings with their correct text) can also teach the model: `/training`
@@ -313,7 +348,8 @@ tab shows each part with its settings:
   `gradient_accumulation_steps`, `warmup_steps`, `max_steps`, `eval_steps`, `logging_steps`, `generation_max_length`,
   `lr_scheduler_type`, `weight_decay`, `gradient_checkpointing`, `fp16` on a GPU, `load_best_model_at_end`, `seed`),
   plus `freeze_encoder` (on by default: only the decoder, which writes the words, learns; less memory and less
-  overfitting on a small set).
+  overfitting on a small set; the exported model then keeps its base's encoder file and shares its encoder, see
+  [Encoder cache and shared encoders](#encoder-cache-and-shared-encoders)).
 
 `POST /training/runs` queues a run (one at a time, never retried): the clips are shuffled and split (`test_size`,
 `seed`), the base model is scored on the test clips, trained (evaluated every `eval_steps` with `generate()`),
@@ -394,6 +430,9 @@ pytest
 | `WORKER_CONCURRENCY` / `MAX_QUEUE_SIZE` | `1` / `20` | Parallel transcriptions; uploads get `503` when the queue is full |
 | `MAX_FINISHED_JOBS` | `200` | Finished jobs kept for `GET /jobs/{id}`; older ones are forgotten |
 | `UPLOAD_DIR` | `./data/uploads` | Uploads wait here until decoded, then are deleted |
+| `ENCODER_CACHE_MB` | `64` | Encoder outputs kept in memory and reused (0 = off) |
+| `ENCODER_CACHE_DIR` | – | Also keep them on disk here, across restarts and deploys |
+| `ENCODER_CACHE_DISK_MB` | `256` | At most this much on disk (the least recently used deleted first) |
 | `TRAINING` | `false` | Build arg: PyTorch and transformers in the image (`/opt/train`) for fine-tuning |
 | `TRAINING_PYTHON` | this Python (`/opt/train/bin/python` in Docker) | The Python that fine-tunes: needs torch and transformers |
 | `TRAINING_DIR` | `./data/training` | Training runs, their logs and the fine-tuned models |

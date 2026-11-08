@@ -29,6 +29,7 @@ from app.formats import RENDERERS
 from app.jobs import JobNotFound, QueueFullError, TranscriptionService
 from app.models import HEADROOM, ModelSet, ModelUnavailable, memory_limit_mb
 from app.ct2 import COMPUTE_TYPES, CT2Engine
+from app.encoder_cache import EncoderCache
 from app.training import TrainingManager, TrainingStore
 from app.training_api import router as training_router
 from app.vad import MAX_PIECE_SECONDS, SPEECH_PAD_MS, load_vad
@@ -86,6 +87,8 @@ class Components:
     ct2: object | None = None
     # The Python that fine-tunes (tests pass a stand-in script); default: TRAINING_PYTHON.
     training_python: str | None = None
+    # Encoder outputs kept and reused by every model (tests pass their own); default: from the ENCODER_CACHE_* settings.
+    encoder_cache: EncoderCache | None = None
 
 
 def _clock(seconds: float) -> str:
@@ -97,24 +100,32 @@ def create_app(settings: Settings | None = None, components: Components | None =
     settings = settings or get_settings()
     components = components or Components()
 
+    encoder_cache = components.encoder_cache or EncoderCache(settings.encoder_cache_mb, settings.encoder_cache_dir or None,
+                                                             settings.encoder_cache_disk_mb)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        app.state.encoder_cache = encoder_cache
         transcriber, transcriber_error = components.transcriber, None
         if transcriber is None:
             try:
                 transcriber = OnnxWhisperTranscriber.from_dir(
                     settings.whisper_model_dir, settings.max_new_tokens, settings.onnx_threads,
                     low_memory=settings.whisper_low_memory, graph_optimization=settings.onnx_graph_optimization,
+                    encoder_cache=encoder_cache,
                 )
                 logger.info("Loaded speech model %s", transcriber.name)
             except Exception as e:  # keep serving: /health reports the reason, /healthz fails
                 transcriber_error = str(e)
                 logger.error("Speech model not loaded: %s", e)
+        if transcriber is not None and getattr(transcriber, "encoder_cache", False) is None:
+            transcriber.encoder_cache = encoder_cache  # one handed in already loaded: the service's cache too
 
         def load_model(path: Path) -> Transcriber:
             return OnnxWhisperTranscriber.from_dir(str(path), settings.max_new_tokens, settings.onnx_threads,
                                                    low_memory=settings.whisper_low_memory,
-                                                   graph_optimization=settings.onnx_graph_optimization)
+                                                   graph_optimization=settings.onnx_graph_optimization,
+                                                   encoder_cache=encoder_cache)
 
         # Models a job can choose: the service's own, every other export in MODELS_DIR (EXTRA_MODELS), and the
         # fine-tuned ones (TRAINING_DIR/models).
@@ -698,6 +709,10 @@ def create_app(settings: Settings | None = None, components: Components | None =
                                                         "session_seconds": getattr(t, "session_seconds", None)}},
                         "ctranslate2": service.ct2.status() if service.ct2 else {"available": False, "error": "not set up"}},
             "memory_limit_mb": round(service.models.limit_mb) if service.models.limit_mb else None,
+            "encoder_cache": {**encoder_cache.stats(),
+                              "description": "The encoder's output for each 30 s window, kept and reused when the same "
+                                             "encoder meets the same window again (a clip run again, the same lines, "
+                                             "a fine-tuned model sharing its base's encoder)"},
             "audio": {"decoder": "ffmpeg (pure-Python fallback for WAV)", "sample_rate": features.SAMPLE_RATE,
                       "channels": 1, "sample_format": "16-bit PCM", "max_audio_seconds": settings.max_audio_seconds,
                       "max_upload_mb": settings.max_upload_mb},

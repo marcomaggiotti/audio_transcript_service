@@ -49,6 +49,9 @@ class InferenceMetrics(BaseModel):
                                                              "(None: CTranslate2, or can't say)")
     session_seconds: float | None = Field(None, description="Opening the encoder and decoder at that level (the graph "
                                                             "optimization included): this job's, or the service's start")
+    encoder_cache_hits: int | None = Field(None, description="Windows whose encoder output came from the encoder cache "
+                                                             "(of `windows`)")
+    windows: int | None = Field(None, description="30 s windows encoded or read from the encoder cache")
 
 
 class WindowAttempt(BaseModel):
@@ -69,6 +72,8 @@ class WindowTrace(BaseModel):
     segments: int = Field(0, description="Segments it produced")
     attempts: list[WindowAttempt] = Field(default_factory=list, description="Each decode; the last one was kept")
     prompt_reset: bool = Field(False, description="Its text looped, so the next window wasn't prompted with it")
+    encoder_cached: bool = Field(False, description="The encoder's output came from the encoder cache: this window was "
+                                                    "encoded before by the same encoder")
 
 
 class Transcript(BaseModel):
