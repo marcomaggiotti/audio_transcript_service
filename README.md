@@ -321,6 +321,52 @@ instead of a second copy in memory, and the same cached windows. A model fine-tu
 see Fine-tuning) is exported with its base's encoder file, so it shares the service model's encoder: `GET /config`
 marks it (`shared_encoder`) and the memory check counts only its decoder.
 
+### How it works, in plain words
+
+**The key: three fingerprints.** A *digest* is a short fingerprint of some bytes (here BLAKE2b, 32 hex characters):
+the same bytes always give the same fingerprint, and any change gives a different one. A cached window is filed under
+three of them, because the encoder's output can only be reused when all three match:
+
+| Part of the key | Fingerprint of | Why it is needed |
+|---|---|---|
+| Encoder | the encoder's ONNX file (`encoder_model.onnx`, and its `.onnx_data` if any) | Another model, another precision (fp32, int8) or a retrained encoder computes different vectors. The fingerprint looks at the file's content, not its name or folder, so the same file copied elsewhere counts as the same encoder. It is computed once per file and remembered while the file's size and date don't change |
+| Optimization level | ONNX Runtime's graph optimization level (`disabled` … `all`) | Each level rewrites the graph differently, so the numbers can differ in their last digits. Keeping levels apart keeps a cached window exactly what that session would have computed |
+| Spectrogram | the window's log-mel spectrogram (80 × 3000 numbers) | This is exactly what the encoder reads. The same audio cut the same way gives the same spectrogram, wherever it comes from: another job, another recording, another day |
+
+**Where it is kept: an LRU, and optionally a folder.** *LRU* means "least recently used": the cache has a size limit
+(`ENCODER_CACHE_MB`), and when a new window doesn't fit, the window that was used longest ago is dropped first. Each
+time a window is reused it moves to the front, so the windows in use stay. Memory is lost when the service restarts.
+With `ENCODER_CACHE_DIR`, each window is also written to that folder as a small `.npy` file named after its key
+(2.3 MB for whisper-tiny.en). On a miss in memory the folder is checked before encoding. The folder has its own limit
+(`ENCODER_CACHE_DISK_MB`): past it, the files used longest ago are deleted, down to 90% of the limit so it isn't
+trimming at every new window. A file being written goes to `<key>.tmp` first and is renamed when complete, so a crash
+never leaves half a file that could be read back.
+
+**One session for identical encoder files.** A *session* is ONNX Runtime's loaded copy of a graph, with its weights in
+memory (about 45 MB for whisper-tiny.en's encoder, several hundred for larger models). When a model is loaded, its
+encoder file's fingerprint is looked up among the encoder sessions already open (with the same optimization level,
+threads and memory option). If one is found, the new model uses that session instead of loading a second copy. The
+list holds sessions *weakly*: when no model uses a session any more, it is freed as before.
+
+**Fine-tunes reuse the base encoder file.** With `freeze_encoder` on (the default in the Training tab), training never
+changes the encoder's weights: only the decoder learns. The ONNX export would still write a new encoder file, whose
+bytes might differ even though its weights are the same (names and metadata inside the file). So after the export the
+fine-tuned model's `encoder_model.onnx` is replaced by a copy of its base model's file. The two are then byte for byte
+the same, so they have the same fingerprint: one session in memory for both, and a window encoded for the base is
+reused by the fine-tuned model (comparing them on the benchmark set encodes each clip once). With `freeze_encoder` off
+the encoder was trained, its file is its own, and nothing is shared, as it must be.
+
+**What a job tells you.** Every job keeps a *window trace*: one record per 30 s window (where it started, how much it
+moved on, its decoding attempts...). Each record now also says `encoder_cached`: whether that window's encoder output
+came from the cache. The job's metrics add them up (`windows`, `encoder_cache_hits`).
+
+**How it is tested.** Most tests don't load a real Whisper: they use *fakes*, small stand-ins that act like ONNX
+sessions (the fake encoder counts its calls and returns numbered outputs). The cache tests check that a second model
+with the same encoder file doesn't call its encoder at all and writes the same text, and that another optimization
+level does call it. The tests with PyTorch (`tests/test_training_worker.py`) use a real exported model: a cached window
+gives the identical transcript, two loads of the same export share one session, and a fine-tune with the encoder
+frozen gets the base's encoder file byte for byte and reuses the base's cached window.
+
 **Why not keep the decoder's KV cache for all the audio?** Its keys and values depend on the window's audio (every
 decoder layer after the first attends to the encoder's output) and on the text written so far, so no two windows share
 them. Within a window the service already reuses them from step to step (`KV_CACHE`), and beam search's beams share the
