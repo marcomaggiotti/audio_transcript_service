@@ -16,7 +16,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from app.asr import PRECISIONS, Transcriber, _release_memory, is_multilingual_config, onnx_precision
+from app.asr import (PRECISIONS, Transcriber, _release_memory, is_multilingual_config, onnx_fused_attention,
+                     onnx_precision)
 from app.encoder_cache import file_digest
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,8 @@ class ModelInfo:
     encoder_mb: float = 0.0  # the default encoder file
     encoder_digest: str | None = None  # its content: models with the same one share the encoder session and outputs
     shared_encoder: str | None = None  # the service's own model, when this one's encoder file is the same
+    # {encoder, decoder}: attention fused into ONNX Runtime's MultiHeadAttention by the export (fuse_attention)
+    fused_attention: dict[str, bool] = field(default_factory=dict)
 
     @property
     def needs_mb(self) -> float:
@@ -53,7 +56,7 @@ class ModelInfo:
         return {"id": self.id, "default": self.default, "precision": self.precision,
                 "available_precisions": self.available_precisions, "size_mb": round(self.size_mb),
                 "needs_mb": None if self.default else self.needs_mb, "fits": fits, "reason": reason,
-                "shared_encoder": self.shared_encoder}
+                "shared_encoder": self.shared_encoder, "fused_attention": self.fused_attention}
 
 
 def describe_export(path: Path, default: bool = False) -> ModelInfo:
@@ -66,6 +69,7 @@ def describe_export(path: Path, default: bool = False) -> ModelInfo:
         main = path / default_file
         try:
             info.precision[part] = onnx_precision(main)
+            info.fused_attention[part] = onnx_fused_attention(main)
         except (OSError, ValueError):  # missing or empty (a placeholder): nothing to say about this part
             continue
         info.size_mb += main.stat().st_size / 1e6

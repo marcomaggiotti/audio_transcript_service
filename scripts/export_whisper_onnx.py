@@ -11,8 +11,14 @@ Pipeline (each step keeps the graphs runnable on the runtime's onnxruntime):
   2. Untie the LM head: optimum ties proj_out to the token embedding through a Transpose, which ONNX Runtime
      constant-folds into a second fp32 copy at load (and quantize_dynamic leaves fp32 + a per-step
      dequantize). The embedding Gather is rewritten to read the transposed table, so one table serves both.
-  3. Fuse the encoder's self-attention into com.microsoft.MultiHeadAttention (no [heads, 1500, 1500]
-     score tensor; ~-40 MB peak per window).
+  3. Fuse every attention block into com.microsoft.MultiHeadAttention, ONNX Runtime's transformer kernel: the
+     encoder's self-attention (no [heads, 1500, 1500] score tensor; ~-40 MB peak per window) and the decoders'
+     self-attention (the causal mask passed as attention_bias, the KV cache as it is) and cross-attention. Where
+     the graph doesn't have the expected pattern a block is left as it is, and a fused graph is kept only if it
+     gives the same outputs as the exported one (checked on sample inputs; otherwise the export's is kept).
+     whisper-tiny: 20 blocks; a cached decoder step 9% faster (int8) and 4% (fp32), the same transcripts.
+     --no-fuse-attention skips it. (ONNX Runtime's own transformer optimizer finds no attention in this export,
+     and its LayerNorm/GELU fusions are what the runtime's graph optimization already does when it opens a model.)
   4. INT8 dynamic quantization of the decoder (weights int8 per channel, activations quantized on the fly).
      The encoder stays fp32: quantizing it garbles real speech. Measured with the real whisper-tiny weights
      (20 TTS sentences + a recorded voice note): fp32 5.0% WER; decoder int8 5.7% (+27 MB RAM over all-int8);
@@ -70,8 +76,17 @@ def untie_lm_head(path: Path) -> None:
     onnx.save(model, path)
 
 
-def fuse_encoder_attention(path: Path, num_heads: int) -> int:
-    """Replace MatMul(q*s, k*s) -> Softmax -> MatMul(v) (optimum's SDPA export) by MultiHeadAttention."""
+def fuse_attention(path: Path, num_heads: int) -> int:
+    """Replace each attention block of optimum's (SDPA) export by com.microsoft.MultiHeadAttention:
+
+        q: Reshape(q) -> Transpose(0,2,1,3) -> Mul(c_q)                 (q already scaled by the export)
+        k: Reshape(k) -> Transpose(0,2,3,1) -> Mul(c_k)   or   K [batch, heads, L, head] -> Transpose(0,1,3,2) -> Mul(c_k)
+        MatMul(q, k) [-> Add(mask)] -> Softmax [-> Where(IsNaN(p), 0, p)] -> MatMul(., V) -> Transpose(0,2,1,3) -> Reshape
+
+    becomes MultiHeadAttention(q, key, value, attention_bias=mask, scale=c_q*c_k), with key and value as
+    [batch, L, hidden] (projections: the encoder, a decoder's first call) or [batch, heads, L, head] (the KV cache:
+    later calls). The causal mask goes in unchanged, so any number of new tokens is masked as before. Returns how
+    many blocks were fused; one that doesn't match is left as exported."""
     import onnx
     from onnx import helper, numpy_helper
 
@@ -82,7 +97,8 @@ def fuse_encoder_attention(path: Path, num_heads: int) -> int:
     for n in graph.node:
         for i in n.input:
             consumers.setdefault(i, []).append(n)
-    consts = {n.output[0]: numpy_helper.to_array(n.attribute[0].t) for n in graph.node if n.op_type == "Constant"}
+    consts = {n.output[0]: numpy_helper.to_array(n.attribute[0].t) for n in graph.node
+              if n.op_type == "Constant" and n.attribute and n.attribute[0].name == "value"}
     consts.update({t.name: numpy_helper.to_array(t) for t in graph.initializer})
 
     def up(name, op):
@@ -97,30 +113,66 @@ def fuse_encoder_attention(path: Path, num_heads: int) -> int:
             raise LookupError(f"{name}: expected a single {op}")
         return nodes[0]
 
+    def perm(node):
+        return next((list(a.ints) for a in node.attribute if a.name == "perm"), None)
+
+    def scalar(name):
+        value = consts[name]
+        if value.size != 1:
+            raise LookupError(f"{name}: not a scalar")
+        return float(value.reshape(-1)[0])
+
     fused = 0
     for softmax in [n for n in graph.node if n.op_type == "Softmax"]:
         try:
-            qk = up(softmax.input[0], "MatMul")
+            core, scores, mask = [], softmax.input[0], None  # core: the nodes this block replaces
+            add = producers.get(scores)
+            if add is not None and add.op_type == "Add":  # scores + causal mask
+                scores = next(i for i in add.input if producers.get(i) is not None and producers[i].op_type == "MatMul")
+                mask = next(i for i in add.input if i != scores)
+                core.append(add)
+            qk = up(scores, "MatMul")
             mul_q, mul_k = up(qk.input[0], "Mul"), up(qk.input[1], "Mul")
             t_q, t_k = up(mul_q.input[0], "Transpose"), up(mul_k.input[0], "Transpose")
-            r_q, r_k = up(t_q.input[0], "Reshape"), up(t_k.input[0], "Reshape")
-            av = only_consumer(softmax.output[0], "MatMul")
-            t_v = up(av.input[1], "Transpose")
-            r_v = up(t_v.input[0], "Reshape")
+            r_q = up(t_q.input[0], "Reshape")
+            if perm(t_q) != [0, 2, 1, 3]:
+                raise LookupError("query layout")
+            probs, users = softmax.output[0], consumers.get(softmax.output[0], [])
+            if len(users) == 2 and sorted(u.op_type for u in users) == ["IsNaN", "Where"]:  # rows with no key: 0
+                isnan = next(u for u in users if u.op_type == "IsNaN")
+                where = only_consumer(isnan.output[0], "Where")
+                if where.input[2] != probs:
+                    raise LookupError("NaN guard")
+                core += [isnan, where]
+                probs = where.output[0]
+            av = only_consumer(probs, "MatMul")
             t_o = only_consumer(av.output[0], "Transpose")
             r_o = only_consumer(t_o.output[0], "Reshape")
-            scale = float(consts[mul_q.input[1]]) * float(consts[mul_k.input[1]])
-        except (LookupError, KeyError):
-            continue  # not the expected pattern: leave this block unfused
-        mha = helper.make_node("MultiHeadAttention", [r_q.input[0], r_k.input[0], r_v.input[0]], [r_o.output[0]],
-                               domain="com.microsoft", num_heads=num_heads, scale=scale)
-        for n in (r_o, t_o, av, softmax, qk, mul_q, mul_k, t_q, t_k, t_v, r_q, r_k, r_v):
+            if perm(t_o) != [0, 2, 1, 3]:
+                raise LookupError("output layout")
+            if perm(t_k) == [0, 2, 3, 1]:  # keys from a projection: key and value as [batch, L, hidden]
+                key = up(t_k.input[0], "Reshape").input[0]
+                t_v = up(av.input[1], "Transpose")
+                if perm(t_v) != [0, 2, 1, 3]:
+                    raise LookupError("value layout")
+                value = up(t_v.input[0], "Reshape").input[0]
+            elif perm(t_k) == [0, 1, 3, 2]:  # keys from the cache: key and value as [batch, heads, L, head]
+                key, value = t_k.input[0], av.input[1]
+            else:
+                raise LookupError("key layout")
+            scale = scalar(mul_q.input[1]) * scalar(mul_k.input[1])
+        except (LookupError, KeyError, StopIteration):
+            continue  # not the expected pattern: leave this block as exported
+        name = f"{softmax.name.rsplit('/', 1)[0]}/MultiHeadAttention" if softmax.name else f"MultiHeadAttention_{fused}"
+        mha = helper.make_node("MultiHeadAttention", [r_q.input[0], key, value] + (["", "", mask] if mask else []),
+                               [r_o.output[0]], name=name, domain="com.microsoft", num_heads=num_heads, scale=scale)
+        for n in core + [qk, mul_q, mul_k, softmax, av, t_o, r_o]:
             graph.node.remove(n)
         graph.node.append(mha)
         fused += 1
     if not fused:
         return 0
-    # drop the shape-computation nodes that only fed the removed Reshapes, then restore topological order
+    # drop what only fed the replaced nodes (reshapes, transposes, shape computations), then restore topological order
     needed = {o.name for o in graph.output}
     while True:
         used = needed | {i for n in graph.node for i in n.input}
@@ -142,6 +194,70 @@ def fuse_encoder_attention(path: Path, num_heads: int) -> int:
         model.opset_import.append(helper.make_opsetid("com.microsoft", 1))
     onnx.save(model, path)
     return fused
+
+
+def sample_inputs(path: Path, batch: int = 1, sequence: int = 3, past: int = 5, seed: int = 0) -> dict:
+    """Random inputs for one of the exported graphs, the dimensions by their names: token ids, encoder states, a
+    KV cache of `past` tokens, `sequence` new tokens (the encoder's mel features have fixed dimensions)."""
+    import numpy as np
+    import onnx
+
+    rng = np.random.default_rng(seed)
+    feed = {}
+    for inp in onnx.load(path, load_external_data=False).graph.input:
+        dims = []
+        for d in inp.type.tensor_type.shape.dim:
+            name = d.dim_param
+            dims.append(d.dim_value if d.dim_value else batch if "batch" in name else past if "past" in name
+                        else 1500 if "encoder_sequence" in name else sequence)
+        if inp.name == "input_ids":
+            feed[inp.name] = rng.integers(0, 50000, size=dims, dtype=np.int64)
+        else:
+            feed[inp.name] = rng.standard_normal(dims).astype(np.float32)
+    return feed
+
+
+def max_difference(original: Path, changed: Path, feeds: list[dict]) -> float:
+    """The largest difference between two graphs' outputs on these inputs (ONNX Runtime, CPU)."""
+    import numpy as np
+    import onnxruntime as ort
+
+    a = ort.InferenceSession(str(original), providers=["CPUExecutionProvider"])
+    b = ort.InferenceSession(str(changed), providers=["CPUExecutionProvider"])
+    worst = 0.0
+    for feed in feeds:
+        for x, y in zip(a.run(None, feed), b.run(None, feed)):
+            if x.size:
+                diff = float(np.max(np.abs(x.astype(np.float64) - y.astype(np.float64))))
+                if not np.isfinite(diff):
+                    return float("nan")
+                worst = max(worst, diff)
+    return worst
+
+
+def fuse_and_check(path: Path, num_heads: int, feeds: list[tuple[int, int, int]], tolerance: float = 1e-3) -> str:
+    """fuse_attention, kept only if the fused graph runs and gives the exported graph's outputs (within
+    `tolerance`) on sample inputs: (batch, new tokens, cached tokens) per case. Says what happened."""
+    original = path.with_name(path.name + ".unfused")
+    shutil.copy(path, original)
+    try:
+        fused = fuse_attention(path, num_heads)
+        if not fused:
+            return "no attention block in the expected pattern: kept as exported"
+        cases = [sample_inputs(original, b, s, p, seed) for seed, (b, s, p) in enumerate(feeds)]
+        try:
+            diff = max_difference(original, path, cases)
+        except Exception as e:  # the runtime can't run it (an older ONNX Runtime, another layout)
+            diff, why = float("nan"), f"{type(e).__name__}: {str(e)[:200]}"
+        else:
+            why = f"outputs differ by {diff:g}"
+        if not diff <= tolerance:
+            shutil.copy(original, path)
+            return f"{fused} block{'s' if fused != 1 else ''} fused but {why}: kept as exported"
+        return (f"{fused} attention block{'s' if fused != 1 else ''} fused ("
+                + (f"outputs within {diff:.1g} of" if diff else "the same outputs as") + " the exported graph)")
+    finally:
+        original.unlink(missing_ok=True)
 
 
 def quantize(path: Path) -> None:
@@ -253,6 +369,8 @@ def main() -> int:
     parser.add_argument("--ct2", action="store_true",
                         help="Also convert the checkpoint for CTranslate2 into OUTPUT/ct2 (needs ctranslate2), for "
                              "jobs with engine=ctranslate2")
+    parser.add_argument("--no-fuse-attention", dest="fuse_attention", action="store_false",
+                        help="Keep the attention as exported (no MultiHeadAttention), e.g. to measure the fusion")
     parser.add_argument("--prune", action="store_true",
                         help="Delete exported graphs the service does not load (smaller Docker image)")
     args = parser.parse_args()
@@ -274,8 +392,12 @@ def main() -> int:
     config = json.loads((output / "config.json").read_text())
     for name in ("decoder_model.onnx", "decoder_with_past_model.onnx"):
         untie_lm_head(output / name)
-    fused = fuse_encoder_attention(output / "encoder_model.onnx", config["encoder_attention_heads"])
-    print(f"fused {fused}/{config['encoder_layers']} encoder attention blocks")
+    if args.fuse_attention:  # (batch, new tokens, cached tokens) of the sample inputs each graph is checked on
+        for name, heads, feeds in (("encoder_model.onnx", config["encoder_attention_heads"], [(1, 1, 0)]),
+                                   ("decoder_model.onnx", config["decoder_attention_heads"], [(1, 4, 0), (2, 3, 0)]),
+                                   ("decoder_with_past_model.onnx", config["decoder_attention_heads"],
+                                    [(1, 1, 5), (2, 3, 7)])):
+            print(f"{name}: {fuse_and_check(output / name, heads, feeds)}")
     mode = "none" if args.fp32 else args.quantize
     default = {"encoder": "int8" if mode == "all" else "fp32", "decoder": "fp32" if mode == "none" else "int8"}
     build_precisions(output, default, args.variants, args.int4)

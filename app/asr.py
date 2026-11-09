@@ -285,6 +285,15 @@ def onnx_precision(path: Path) -> str:
         return "int8" if data.find(b"DynamicQuantizeLinear") >= 0 or data.find(b"MatMulInteger") >= 0 else "fp32"
 
 
+def onnx_fused_attention(path: Path) -> bool:
+    """Whether the export runs its attention in ONNX Runtime's MultiHeadAttention kernel (scripts/export_whisper_onnx.py
+    fuse_attention): read from the op names in the file, like onnx_precision."""
+    import mmap
+
+    with path.open("rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+        return data.find(b"MultiHeadAttention") >= 0
+
+
 @dataclass
 class WhisperTokens:
     """Special token ids, resolved from the tokenizer and generation config."""

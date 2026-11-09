@@ -703,6 +703,9 @@ def create_app(settings: Settings | None = None, components: Components | None =
             "models": [m.view(*service.models.fits(m)) for m in service.models.list()],
             "engines": {"onnx": {"available": t is not None, "runtime": "ONNX Runtime (CPU)",
                                  "precisions": list(asr.PRECISIONS),
+                                 # the export's attention in ONNX Runtime's MultiHeadAttention kernel, per part
+                                 "fused_attention": next((m.fused_attention for m in service.models.list()
+                                                          if m.default), {}),
                                  "graph_optimization": {"default": getattr(t, "graph_optimization", None)
                                                         or settings.onnx_graph_optimization,
                                                         "levels": list(asr.GRAPH_LEVELS),
